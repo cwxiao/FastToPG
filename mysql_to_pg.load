@@ -1,0 +1,18 @@
+LOAD DATABASE
+     FROM mysql://root:123456@host.docker.internal:3306/{{DB_NAME}}
+     INTO postgresql://postgres:Postgres123!@host.docker.internal:5432/{{DB_NAME}}
+
+WITH
+     include drop,
+     create tables,
+     create indexes,
+     reset sequences,
+     foreign keys,
+     workers = 2,
+     concurrency = 1,
+     batch rows = 10000,
+     prefetch rows = 10000
+
+CAST
+     type tinyint to smallint drop typemod,
+     type datetime to timestamp;

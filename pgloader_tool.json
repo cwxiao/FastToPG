@@ -1,0 +1,23 @@
+{
+  "databases": [
+    "iucp_camunda",
+    "iucp_data",
+    "iucp_nacos",
+    "iucp_normal",
+    "iucp_xxl_job"
+  ],
+  "load_template": "mysql_to_pg.load",
+  "mysql": {
+    "container": "mysql8",
+    "user": "root",
+    "password": "123456"
+  },
+  "pgloader": {
+    "image": "dimitri/pgloader",
+    "env": {
+      "PGLOADER_DYNSIZE": "2GB",
+      "SBCL_DYNAMIC_SPACE_SIZE": "4096"
+    },
+    "show_output": false
+  }
+}
