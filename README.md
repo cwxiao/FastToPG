@@ -60,13 +60,33 @@
 ### 方式一：图形界面
 
 1. 运行 run_gui.ps1。
-2. 在界面中填写源库、目标库、表/库映射与迁移参数。
-3. 点击开始迁移。
+2. 在“配置文件”处选择或加载 pgloader_tool.json。
+3. 选择“源类型”，填写“源连接 URI”和“目标连接 URI”。
+  - URI 可包含 `{{DB_NAME}}` 占位符。
+4. 选择/编辑“模板文件”，确认或修改“Load 脚本内容”。
+  - 脚本内可使用 `{{SOURCE_URI}}` 与 `{{TARGET_URI}}` 占位符。
+5. 在左侧列表中选择要迁移的数据库（可多选）。
+6. 点击“开始同步”，观察日志与进度。
+
+示例（MySQL → PostgreSQL）：
+
+- 源连接 URI：`mysql://root:123456@host.docker.internal:3306/{{DB_NAME}}`
+- 目标连接 URI：`postgresql://postgres:Postgres123!@host.docker.internal:5432/{{DB_NAME}}`
 
 ### 方式二：命令行
 
-1. 根据实际环境修改 pgloader_tool.json 与 mysql_to_pg.load。
-2. 运行 pgloader_tool.py。
+1. 根据实际环境修改 pgloader_tool.json 与 mysql_to_pg.load：
+  - `source.type`：源类型（mysql/mssql/sqlite/pgsql/redshift/file）
+  - `source.uri`：源连接 URI（支持 `{{DB_NAME}}`）
+  - `target.uri`：目标连接 URI（支持 `{{DB_NAME}}`）
+  - `load_template`：load 脚本文件名
+2. 执行：
+  - 迁移配置中所有数据库：运行 `pgloader_tool.py`
+  - 仅迁移指定库：运行 `pgloader_tool.py --db your_db_name`（可重复传入多个 `--db`）
+
+示例（仅迁移一个库）：
+
+- `pgloader_tool.py --db iucp_data`
 
 ## 配置说明（概要）
 
