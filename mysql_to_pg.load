@@ -1,6 +1,6 @@
 LOAD DATABASE
-     FROM mysql://root:123456@host.docker.internal:3306/{{DB_NAME}}
-     INTO postgresql://postgres:Postgres123!@host.docker.internal:5432/{{DB_NAME}}
+     FROM {{SOURCE_URI}}
+     INTO {{TARGET_URI}}
 
 WITH
      include drop,

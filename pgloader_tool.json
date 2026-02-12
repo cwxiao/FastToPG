@@ -7,6 +7,13 @@
     "iucp_xxl_job"
   ],
   "load_template": "mysql_to_pg.load",
+  "source": {
+    "type": "mysql",
+    "uri": "mysql://root:123456@host.docker.internal:3306/{{DB_NAME}}"
+  },
+  "target": {
+    "uri": "postgresql://postgres:Postgres123!@host.docker.internal:5432/{{DB_NAME}}"
+  },
   "mysql": {
     "container": "mysql8",
     "user": "root",

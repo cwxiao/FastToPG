@@ -41,10 +41,20 @@ def get_total_tables(mysql_container: str, user: str, password: str, db: str) ->
         return 0
 
 
+def render_load_file(template_path: str, output_path: str, replacements: Dict[str, str]) -> None:
+    with open(template_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    for key, value in replacements.items():
+        content = content.replace(f"{{{{{key}}}}}", value)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
 def build_pgloader_command(
     workspace: str,
-    load_template: str,
-    db: str,
+    load_file: str,
     image: str,
     env: Dict[str, str],
 ) -> List[str]:
@@ -55,8 +65,7 @@ def build_pgloader_command(
     cmd.extend([
         "sh",
         "-c",
-        f"sed 's/{{{{DB_NAME}}}}/{db}/g' /pgloader/{load_template} > /tmp/load.load; "
-        "pgloader --on-error-stop /tmp/load.load",
+        f"pgloader --on-error-stop /pgloader/{load_file}",
     ])
     return cmd
 
@@ -79,19 +88,40 @@ def run_pgloader_for_db(
     config: Dict,
     workspace: str,
 ) -> int:
-    mysql_cfg = config["mysql"]
+    mysql_cfg = config.get("mysql", {})
     pgloader_cfg = config["pgloader"]
-    total_tables = get_total_tables(
-        mysql_cfg["container"],
-        mysql_cfg["user"],
-        mysql_cfg["password"],
-        db,
+    source_cfg = config.get("source", {})
+    target_cfg = config.get("target", {})
+    source_type = source_cfg.get("type", "mysql")
+
+    total_tables = 0
+    if source_type == "mysql":
+        total_tables = get_total_tables(
+            mysql_cfg.get("container", ""),
+            mysql_cfg.get("user", ""),
+            mysql_cfg.get("password", ""),
+            db,
+        )
+
+    source_uri = source_cfg.get("uri", "").replace("{{DB_NAME}}", db)
+    target_uri = target_cfg.get("uri", "").replace("{{DB_NAME}}", db)
+
+    template_path = os.path.join(workspace, config["load_template"])
+    rendered_name = f".pgloader_rendered_{db}.load"
+    rendered_path = os.path.join(workspace, rendered_name)
+    render_load_file(
+        template_path,
+        rendered_path,
+        {
+            "DB_NAME": db,
+            "SOURCE_URI": source_uri,
+            "TARGET_URI": target_uri,
+        },
     )
 
     cmd = build_pgloader_command(
         workspace=workspace,
-        load_template=config["load_template"],
-        db=db,
+        load_file=rendered_name,
         image=pgloader_cfg["image"],
         env=pgloader_cfg.get("env", {}),
     )

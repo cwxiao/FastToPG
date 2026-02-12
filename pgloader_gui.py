@@ -10,6 +10,7 @@ from collections import deque
 from tkinter import ttk, messagebox, filedialog
 
 DEFAULT_CONFIG = "pgloader_tool.json"
+SOURCE_TYPES = ["mysql", "mssql", "sqlite", "pgsql", "redshift", "file"]
 
 
 def load_config(path: str) -> dict:
@@ -50,10 +51,20 @@ def get_total_tables(mysql_container: str, user: str, password: str, db: str) ->
         return 0
 
 
+def render_load_file(template_path: str, output_path: str, replacements: dict) -> None:
+    with open(template_path, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    for key, value in replacements.items():
+        content = content.replace(f"{{{{{key}}}}}", value)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
 def build_pgloader_command(
     workspace: str,
-    load_template: str,
-    db: str,
+    load_file: str,
     image: str,
     env: dict,
 ) -> list:
@@ -61,21 +72,18 @@ def build_pgloader_command(
     for key, value in env.items():
         cmd.extend(["-e", f"{key}={value}"])
     cmd.extend(["-v", f"{workspace}:/pgloader", image])
-    cmd.extend(
-        [
-            "sh",
-            "-c",
-            f"sed 's/{{{{DB_NAME}}}}/{db}/g' /pgloader/{load_template} > /tmp/load.load; "
-            "pgloader --on-error-stop /tmp/load.load",
-        ]
-    )
+    cmd.extend([
+        "sh",
+        "-c",
+        f"pgloader --on-error-stop /pgloader/{load_file}",
+    ])
     return cmd
 
 
 class PgloaderGUI(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("pgloader 同步工具")
+        self.title("FastDBConvert")
         self.geometry("900x640")
         self.resizable(True, True)
 
@@ -92,6 +100,9 @@ class PgloaderGUI(tk.Tk):
 
         self.config_path = tk.StringVar(value=os.path.join(self.workspace, DEFAULT_CONFIG))
         self.load_template = tk.StringVar()
+        self.source_type = tk.StringVar(value="mysql")
+        self.source_uri = tk.StringVar()
+        self.target_uri = tk.StringVar()
         self.mysql_container = tk.StringVar()
         self.mysql_user = tk.StringVar()
         self.mysql_password = tk.StringVar()
@@ -156,6 +167,21 @@ class PgloaderGUI(tk.Tk):
         self.load_template_entry.grid(row=row, column=1, sticky="we", padx=5, pady=2)
         row += 1
 
+        ttk.Label(settings, text="源类型").grid(row=row, column=0, sticky="w")
+        self.source_type_combo = ttk.Combobox(settings, values=SOURCE_TYPES, textvariable=self.source_type, state="readonly")
+        self.source_type_combo.grid(row=row, column=1, sticky="we", padx=5, pady=2)
+        row += 1
+
+        ttk.Label(settings, text="源连接 URI").grid(row=row, column=0, sticky="w")
+        self.source_uri_entry = ttk.Entry(settings, textvariable=self.source_uri)
+        self.source_uri_entry.grid(row=row, column=1, sticky="we", padx=5, pady=2)
+        row += 1
+
+        ttk.Label(settings, text="目标连接 URI").grid(row=row, column=0, sticky="w")
+        self.target_uri_entry = ttk.Entry(settings, textvariable=self.target_uri)
+        self.target_uri_entry.grid(row=row, column=1, sticky="we", padx=5, pady=2)
+        row += 1
+
         ttk.Label(settings, text="MySQL 容器").grid(row=row, column=0, sticky="w")
         self.mysql_container_entry = ttk.Entry(settings, textvariable=self.mysql_container)
         self.mysql_container_entry.grid(row=row, column=1, sticky="we", padx=5, pady=2)
@@ -179,6 +205,19 @@ class PgloaderGUI(tk.Tk):
         ttk.Label(settings, text="环境变量 (JSON)").grid(row=row, column=0, sticky="nw")
         self.env_text = tk.Text(settings, height=6)
         self.env_text.grid(row=row, column=1, sticky="we", padx=5, pady=2)
+        row += 1
+
+        ttk.Label(settings, text="Load 脚本内容").grid(row=row, column=0, sticky="nw")
+        self.load_text = tk.Text(settings, height=8)
+        self.load_text.grid(row=row, column=1, sticky="we", padx=5, pady=2)
+        row += 1
+
+        self.load_file_btns = ttk.Frame(settings)
+        self.load_file_btns.grid(row=row, column=1, sticky="w", padx=5, pady=2)
+        self.load_reload_btn = ttk.Button(self.load_file_btns, text="载入模板", command=self._reload_template)
+        self.load_reload_btn.pack(side=tk.LEFT)
+        self.load_save_btn = ttk.Button(self.load_file_btns, text="保存模板", command=self._save_template)
+        self.load_save_btn.pack(side=tk.LEFT, padx=5)
         row += 1
 
         # Always show pgloader output; no toggle needed.
@@ -232,6 +271,11 @@ class PgloaderGUI(tk.Tk):
         self.size_label.configure(text="已选数据库大小: --")
 
         self.load_template.set(config.get("load_template", "mysql_to_pg.load"))
+        source_cfg = config.get("source", {})
+        target_cfg = config.get("target", {})
+        self.source_type.set(source_cfg.get("type", "mysql"))
+        self.source_uri.set(source_cfg.get("uri", ""))
+        self.target_uri.set(target_cfg.get("uri", ""))
         mysql_cfg = config.get("mysql", {})
         self.mysql_container.set(mysql_cfg.get("container", "mysql8"))
         self.mysql_user.set(mysql_cfg.get("user", "root"))
@@ -244,6 +288,8 @@ class PgloaderGUI(tk.Tk):
         self.env_text.delete("1.0", tk.END)
         self.env_text.insert(tk.END, json.dumps(env, ensure_ascii=False, indent=2))
 
+        self._reload_template()
+
     def _save_config_safe(self) -> None:
         try:
             env = json.loads(self.env_text.get("1.0", tk.END).strip() or "{}")
@@ -254,6 +300,13 @@ class PgloaderGUI(tk.Tk):
         config = {
             "databases": list(self.db_list.get(0, tk.END)),
             "load_template": self.load_template.get().strip(),
+            "source": {
+                "type": self.source_type.get().strip(),
+                "uri": self.source_uri.get().strip(),
+            },
+            "target": {
+                "uri": self.target_uri.get().strip(),
+            },
             "mysql": {
                 "container": self.mysql_container.get().strip(),
                 "user": self.mysql_user.get().strip(),
@@ -302,6 +355,13 @@ class PgloaderGUI(tk.Tk):
         config = {
             "databases": dbs,
             "load_template": self.load_template.get().strip(),
+            "source": {
+                "type": self.source_type.get().strip(),
+                "uri": self.source_uri.get().strip(),
+            },
+            "target": {
+                "uri": self.target_uri.get().strip(),
+            },
             "mysql": {
                 "container": self.mysql_container.get().strip(),
                 "user": self.mysql_user.get().strip(),
@@ -351,13 +411,15 @@ class PgloaderGUI(tk.Tk):
             self.overall_processed_tables = 0
             total_dbs = len(config["databases"])
             for db in config["databases"]:
-                mysql_cfg = config["mysql"]
-                self.overall_total_tables += get_total_tables(
-                    mysql_cfg["container"],
-                    mysql_cfg["user"],
-                    mysql_cfg["password"],
-                    db,
-                )
+                source_type = config.get("source", {}).get("type", "mysql")
+                if source_type == "mysql":
+                    mysql_cfg = config["mysql"]
+                    self.overall_total_tables += get_total_tables(
+                        mysql_cfg["container"],
+                        mysql_cfg["user"],
+                        mysql_cfg["password"],
+                        db,
+                    )
 
             for idx, db in enumerate(config["databases"], start=1):
                 if self.stop_event.is_set():
@@ -366,17 +428,35 @@ class PgloaderGUI(tk.Tk):
                 self.queue.put(("log", f"===============================\n开始同步数据库: {db}\n===============================\n"))
 
                 mysql_cfg = config["mysql"]
-                total_tables = get_total_tables(
-                    mysql_cfg["container"],
-                    mysql_cfg["user"],
-                    mysql_cfg["password"],
-                    db,
+                source_type = config.get("source", {}).get("type", "mysql")
+                total_tables = 0
+                if source_type == "mysql":
+                    total_tables = get_total_tables(
+                        mysql_cfg["container"],
+                        mysql_cfg["user"],
+                        mysql_cfg["password"],
+                        db,
+                    )
+
+                source_uri = config.get("source", {}).get("uri", "").replace("{{DB_NAME}}", db)
+                target_uri = config.get("target", {}).get("uri", "").replace("{{DB_NAME}}", db)
+
+                template_path = os.path.join(self.workspace, config["load_template"])
+                rendered_name = f".pgloader_rendered_{db}.load"
+                rendered_path = os.path.join(self.workspace, rendered_name)
+                render_load_file(
+                    template_path,
+                    rendered_path,
+                    {
+                        "DB_NAME": db,
+                        "SOURCE_URI": source_uri,
+                        "TARGET_URI": target_uri,
+                    },
                 )
 
                 cmd = build_pgloader_command(
                     workspace=self.workspace,
-                    load_template=config["load_template"],
-                    db=db,
+                    load_file=rendered_name,
                     image=config["pgloader"]["image"],
                     env=config["pgloader"].get("env", {}),
                 )
@@ -529,11 +609,17 @@ class PgloaderGUI(tk.Tk):
         self.config_save_btn.configure(state=state)
 
         self.load_template_entry.configure(state=state)
+        self.source_type_combo.configure(state=state)
+        self.source_uri_entry.configure(state=state)
+        self.target_uri_entry.configure(state=state)
         self.mysql_container_entry.configure(state=state)
         self.mysql_user_entry.configure(state=state)
         self.mysql_password_entry.configure(state=state)
         self.pgloader_image_entry.configure(state=state)
         self.env_text.configure(state=state)
+        self.load_text.configure(state=state)
+        self.load_reload_btn.configure(state=state)
+        self.load_save_btn.configure(state=state)
         # always on
 
     def _on_db_select(self, _event=None) -> None:
@@ -544,6 +630,9 @@ class PgloaderGUI(tk.Tk):
         threading.Thread(target=self._compute_size_async, args=(dbs,), daemon=True).start()
 
     def _compute_size_async(self, dbs: list[str]) -> None:
+        if self.source_type.get().strip() != "mysql":
+            self.queue.put(("size", 0))
+            return
         mysql_container = self.mysql_container.get().strip()
         mysql_user = self.mysql_user.get().strip()
         mysql_password = self.mysql_password.get()
@@ -575,6 +664,30 @@ class PgloaderGUI(tk.Tk):
                     pass
 
         self.queue.put(("size", total_bytes))
+
+    def _reload_template(self) -> None:
+        template_path = os.path.join(self.workspace, self.load_template.get().strip())
+        if not os.path.exists(template_path):
+            self.load_text.delete("1.0", tk.END)
+            return
+        try:
+            with open(template_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as exc:
+            messagebox.showerror("错误", f"读取模板失败: {exc}")
+            return
+        self.load_text.delete("1.0", tk.END)
+        self.load_text.insert(tk.END, content)
+
+    def _save_template(self) -> None:
+        template_path = os.path.join(self.workspace, self.load_template.get().strip())
+        try:
+            with open(template_path, "w", encoding="utf-8") as f:
+                f.write(self.load_text.get("1.0", tk.END))
+        except Exception as exc:
+            messagebox.showerror("错误", f"保存模板失败: {exc}")
+            return
+        messagebox.showinfo("已保存", "模板已保存。")
 
     def _format_size(self, num_bytes: int) -> str:
         if num_bytes < 1024:
