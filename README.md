@@ -1,4 +1,4 @@
-# FastDBConvert
+# FastToPG
 
 一个基于 pgloader 的多源数据库 → PostgreSQL 迁移小工具，提供命令行与简易图形界面两种使用方式。
 

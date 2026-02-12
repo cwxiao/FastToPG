@@ -83,7 +83,7 @@ def build_pgloader_command(
 class PgloaderGUI(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("FastDBConvert")
+        self.title("FastToPG")
         self.geometry("900x640")
         self.resizable(True, True)
 
