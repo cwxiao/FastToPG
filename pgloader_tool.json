@@ -9,10 +9,19 @@
   "load_template": "mysql_to_pg.load",
   "source": {
     "type": "mysql",
-    "uri": "mysql://root:123456@host.docker.internal:3306/{{DB_NAME}}"
+    "uri": "mysql://fasttopg:FastToPG123@172.17.0.4:3306/{{DB_NAME}}"
   },
   "target": {
-    "uri": "postgresql://postgres:Postgres123!@host.docker.internal:5432/{{DB_NAME}}"
+    "uri": "postgresql://postgres:Postgres123!@172.17.0.3:5432/{{DB_NAME}}",
+    "admin_uri": "postgresql://postgres:Postgres123!@172.17.0.3:5432/{{DB_NAME}}"
+  },
+  "target_user": {
+    "auto_create": false,
+    "name": "fasttopg",
+    "password": "FastToPG123"
+  },
+  "pg_admin": {
+    "image": "postgres:16.11"
   },
   "mysql": {
     "container": "mysql8",
@@ -21,6 +30,8 @@
   },
   "pgloader": {
     "image": "dimitri/pgloader",
+    "mode": "docker",
+    "binary": "pgloader",
     "env": {
       "PGLOADER_DYNSIZE": "2GB",
       "SBCL_DYNAMIC_SPACE_SIZE": "4096"

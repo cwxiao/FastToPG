@@ -16,3 +16,4 @@ WITH
 CAST
      type tinyint to smallint drop typemod,
      type datetime to timestamp;
+

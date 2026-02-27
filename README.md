@@ -19,9 +19,10 @@
 
 1. 已安装 PostgreSQL，并能连接目标数据库。
 2. 已安装 MySQL，并能连接源数据库。
-3. 已安装 pgloader，并能在命令行中直接调用。
-4. Windows 下建议已配置好 PATH，以便脚本可直接调用 pgloader。
-5. 具备源/目标数据库的连接信息与账号权限（读源库、写目标库）。
+3. 具备源/目标数据库的连接信息与账号权限（读源库、写目标库）。
+4. 运行方式二选一：
+  - Docker 模式：需要安装 Docker，并确保可访问 Docker。
+  - 本地模式：需要安装 pgloader 并加入 PATH（或在界面里填写路径）。
 
 ## 支持的数据源与目标（pgloader 能力）
 
@@ -63,15 +64,17 @@
 2. 在“配置文件”处选择或加载 pgloader_tool.json。
 3. 选择“源类型”，填写“源连接 URI”和“目标连接 URI”。
   - URI 可包含 `{{DB_NAME}}` 占位符。
-4. 选择/编辑“模板文件”，确认或修改“Load 脚本内容”。
+4. 在“高级设置”选择 pgloader 运行方式（Docker/本地）。
+5. 选择/编辑“模板文件”，确认或修改“Load 脚本内容”。
   - 脚本内可使用 `{{SOURCE_URI}}` 与 `{{TARGET_URI}}` 占位符。
-5. 在左侧列表中选择要迁移的数据库（可多选）。
-6. 点击“开始同步”，观察日志与进度。
+6. 可点击“测试源连接/测试目标连接”进行连通性检查。
+7. 在左侧列表中选择要迁移的数据库（可多选）。
+8. 点击“开始同步”，观察日志与进度，日志文件会保存到 logs 目录。
 
 示例（MySQL → PostgreSQL）：
 
 - 源连接 URI：`mysql://root:123456@host.docker.internal:3306/{{DB_NAME}}`
-- 目标连接 URI：`postgresql://postgres:Postgres123!@host.docker.internal:5432/{{DB_NAME}}`
+- 目标连接 URI：`postgresql://fasttopg:FastToPG123@host.docker.internal:5432/{{DB_NAME}}`
 
 ### 方式二：命令行
 
@@ -93,14 +96,29 @@
 - pgloader_tool.json：
   - 存放数据库连接信息、迁移参数与可选规则。
   - `source.uri` 与 `target.uri` 支持 `{{DB_NAME}}` 占位符。
+  - `target_user` 可选自动创建目标库用户（需要目标库管理员权限）。
+  - 建议目标用户密码使用字母/数字，避免特殊字符导致工具解析差异。
+  - 启用 `target_user.auto_create` 时，需要提供 `target.admin_uri`（管理员连接）。
+  - `pgloader` 支持 Docker 与本地两种运行方式。
 - mysql_to_pg.load：
   - pgloader 脚本，用于指定迁移规则（表映射、数据清洗、类型转换等）。
   - 支持 `{{SOURCE_URI}}` 与 `{{TARGET_URI}}` 占位符。
+
+## 其他功能
+
+- 模板示例：内置常见源类型模板，可一键应用再微调。
+- 配置档案：自动列出工作目录内的 JSON 配置文件，快速切换。
+- 日志文件：每次运行都会在 logs 目录生成日志文件。
+- 版本信息：界面顶部显示版本号，可一键检查更新。
+- 目标用户：可在“高级设置”里勾选自动创建并授权目标库用户。
+  - 自动创建依赖 PG 管理镜像（默认 postgres:16.11）。
+- 镜像管理：可在“高级设置”一键检查 Docker 并拉取 pgloader/PG 管理镜像。
 
 ## 常见问题
 
 - 无法连接数据库：请检查数据库地址、端口、防火墙与账号权限。
 - 找不到 pgloader：请确认已安装 pgloader 并已加入 PATH。
+- host.docker.internal 无法测试：该地址仅在容器内可用，请在界面勾选“容器内测试”。
 
 ## 后续规划
 
