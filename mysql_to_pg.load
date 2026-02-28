@@ -3,15 +3,16 @@ LOAD DATABASE
      INTO {{TARGET_URI}}
 
 WITH
-     include drop,
+     schema only,
+     include no drop,
      create tables,
      create indexes,
      reset sequences,
      foreign keys,
-     workers = 2,
-     concurrency = 1,
-     batch rows = 10000,
-     prefetch rows = 10000
+     workers = 1,
+     concurrency = 1
+
+ALTER TABLE NAMES MATCHING ~/.*/ SET SCHEMA 'public'
 
 CAST
      type tinyint to smallint drop typemod,

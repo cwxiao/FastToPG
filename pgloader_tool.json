@@ -9,10 +9,11 @@
   "load_template": "mysql_to_pg.load",
   "source": {
     "type": "mysql",
-    "uri": "mysql://root:123456@host.docker.internal:3306/{{DB_NAME}}"
+    "uri": "mysql://fasttopg:FastToPG123@host.docker.internal:3306/{{DB_NAME}}"
   },
   "target": {
-    "uri": "postgresql://postgres:Postgres123!@host.docker.internal:5432/{{DB_NAME}}"
+    "uri": "postgresql://postgres:spxxWYZdev123@192.168.1.121:5432/{{DB_NAME}}",
+    "psql_container": "postgres16"
   },
   "mysql": {
     "container": "mysql8",
@@ -20,11 +21,38 @@
     "password": "123456"
   },
   "pgloader": {
-    "image": "dimitri/pgloader",
+    "image": "dimitri/pgloader:v3.6.7",
     "env": {
-      "PGLOADER_DYNSIZE": "2GB",
-      "SBCL_DYNAMIC_SPACE_SIZE": "4096"
+      "PGLOADER_DYNSIZE": "4GB",
+      "SBCL_DYNAMIC_SPACE_SIZE": "8192"
     },
-    "show_output": false
+    "clear_public_before_sync": true,
+    "cleanup_temp_files": true,
+    "show_output": true
+  },
+  "datax": {
+    "enabled": true,
+    "home": "datax/datax",
+    "python": "python",
+    "jvm": "-Xms2g -Xmx6g -XX:+UseG1GC -XX:+HeapDumpOnOutOfMemoryError",
+    "loglevel": "warn",
+    "source_uri": "mysql://fasttopg:FastToPG123@127.0.0.1:3306/{{DB_NAME}}",
+    "mysql_jdbc_params": "useSSL=false",
+    "target_table_lowercase": true,
+    "target_column_lowercase": true,
+    "exclude_table_keywords": [],
+    "table_parallelism": 30,
+    "channel": 6,
+    "batch_size": 10000,
+    "job_dir": ".datax_jobs",
+    "cleanup_jobs_on_finish": true,
+    "compact_log": true,
+    "show_output": true,
+    "log_retention_days": 7,
+    "log_dirs": [
+      "datax/datax/log",
+      "datax/datax/log_perf"
+    ],
+    "env": {}
   }
 }
