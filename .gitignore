@@ -1,0 +1,4 @@
+datax/
+.datax_jobs/
+.pgloader_rendered_*.load
+__pycache__/
