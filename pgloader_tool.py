@@ -22,6 +22,48 @@ def should_skip_table(table: str, keywords: List[str]) -> bool:
     return False
 
 
+def parse_selected_tables(values: Optional[List[str]]) -> List[str]:
+    if not values:
+        return []
+    result: List[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        for token in str(raw).split(","):
+            name = token.strip()
+            if not name:
+                continue
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(name)
+    return result
+
+
+def filter_tables_by_selected(tables: List[str], selected_tables: List[str]) -> tuple[List[str], List[str]]:
+    if not selected_tables:
+        return list(tables), []
+
+    selected_map = {name.lower(): name for name in selected_tables}
+    selected_keys = set(selected_map.keys())
+    filtered = [table for table in tables if table.lower() in selected_keys]
+    existed_keys = {table.lower() for table in filtered}
+    missing = [selected_map[key] for key in selected_keys if key not in existed_keys]
+    missing.sort()
+    return filtered, missing
+
+
+def build_pgloader_table_filter_clause(tables: List[str]) -> str:
+    if not tables:
+        return ""
+    lines = ["INCLUDING ONLY TABLE NAMES MATCHING"]
+    for idx, table in enumerate(tables):
+        regex = "^" + re.escape(table).replace("/", r"\/") + "$"
+        suffix = "," if idx < len(tables) - 1 else ""
+        lines.append(f"     ~/{regex}/{suffix}")
+    return "\n" + "\n".join(lines) + "\n"
+
+
 def is_datax_key_log(line: str) -> bool:
     text = line.strip()
     if not text:
@@ -93,6 +135,14 @@ def render_load_file(template_path: str, output_path: str, replacements: Dict[st
     with open(template_path, "r", encoding="utf-8") as f:
         content = f.read()
 
+    table_filter = (replacements.get("TABLE_FILTER") or "").strip()
+    if table_filter and "{{TABLE_FILTER}}" not in content:
+        cast_index = content.find("\nCAST")
+        if cast_index >= 0:
+            content = content[:cast_index] + "\n" + table_filter + "\n" + content[cast_index:]
+        else:
+            content = content.rstrip() + "\n\n" + table_filter + "\n"
+
     for key, value in replacements.items():
         content = content.replace(f"{{{{{key}}}}}", value)
 
@@ -132,7 +182,28 @@ def parse_db_uri(uri: str) -> Dict[str, str | int]:
     }
 
 
-def clear_target_public_tables(db: str, config: Dict) -> int:
+def pg_quote_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+def build_clear_public_sql(selected_tables: Optional[List[str]] = None) -> str:
+    selected = parse_selected_tables(selected_tables)
+    if not selected:
+        return (
+            "DO $$ "
+            "DECLARE r record; "
+            "BEGIN "
+            "FOR r IN SELECT tablename FROM pg_tables WHERE schemaname='public' LOOP "
+            "EXECUTE format('DROP TABLE IF EXISTS public.%I CASCADE', r.tablename); "
+            "END LOOP; "
+            "END $$;"
+        )
+
+    stmts = [f"DROP TABLE IF EXISTS public.{pg_quote_ident(table)} CASCADE;" for table in selected]
+    return "\n".join(stmts)
+
+
+def clear_target_public_tables(db: str, config: Dict, selected_tables: Optional[List[str]] = None) -> int:
     target_cfg = config.get("target", {})
     target_uri = target_cfg.get("uri", "").replace("{{DB_NAME}}", db)
     target = parse_db_uri(target_uri)
@@ -141,15 +212,7 @@ def clear_target_public_tables(db: str, config: Dict) -> int:
         print(f"Skip clear public: unsupported target scheme {target.get('scheme')}")
         return 1
 
-    sql = (
-        "DO $$ "
-        "DECLARE r record; "
-        "BEGIN "
-        "FOR r IN SELECT tablename FROM pg_tables WHERE schemaname='public' LOOP "
-        "EXECUTE format('DROP TABLE IF EXISTS public.%I CASCADE', r.tablename); "
-        "END LOOP; "
-        "END $$;"
-    )
+    sql = build_clear_public_sql(selected_tables)
 
     pg_user = str(target.get("user", ""))
     pg_db = str(target.get("database", ""))
@@ -179,7 +242,11 @@ def clear_target_public_tables(db: str, config: Dict) -> int:
         sql,
     ]
 
-    print(f"Clearing target public tables: {target.get('database', '')}")
+    selected = parse_selected_tables(selected_tables)
+    if selected:
+        print(f"Clearing selected target tables: {target.get('database', '')}, tables={len(selected)}")
+    else:
+        print(f"Clearing target public tables: {target.get('database', '')}")
     container_result = run_command(container_cmd)
     if container_result.returncode == 0:
         return 0
@@ -514,12 +581,30 @@ def cleanup_datax_logs_by_retention(workspace: str, datax_cfg: Dict) -> None:
     cleanup_old_logs(workspace, [str(item) for item in log_dirs], retention_days)
 
 
-def run_datax_for_db(db: str, config: Dict, workspace: str) -> int:
+def resolve_datax_home(workspace: str, datax_cfg: Dict) -> str:
+    home = (datax_cfg.get("home") or "").strip()
+    if not home:
+        return ""
+    if os.path.isabs(home):
+        return home
+    return os.path.join(workspace, home)
+
+
+def is_datax_jvm_oom(text: str) -> bool:
+    low = (text or "").lower()
+    return (
+        "insufficient memory for the java runtime environment" in low
+        or "native memory allocation (mmap) failed" in low
+        or "errno=1455" in low
+    )
+
+
+def run_datax_for_db(db: str, config: Dict, workspace: str, selected_tables: Optional[List[str]] = None) -> int:
     datax_cfg = config.get("datax", {})
     if not bool(datax_cfg.get("enabled", False)):
         return 0
 
-    datax_home = (datax_cfg.get("home") or "").strip()
+    datax_home = resolve_datax_home(workspace, datax_cfg)
     if not datax_home:
         print("DataX skipped: missing datax.home in config")
         return 1
@@ -527,7 +612,11 @@ def run_datax_for_db(db: str, config: Dict, workspace: str) -> int:
     datax_py = os.path.join(datax_home, "bin", "datax.py")
     if not os.path.isfile(datax_py):
         print(f"DataX skipped: not found {datax_py}")
+        print("Tip: 请检查 datax.home 配置和当前工作目录是否正确。")
         return 1
+
+    datax_cmd_cfg = dict(datax_cfg)
+    datax_cmd_cfg["home"] = datax_home
 
     mysql_cfg = config.get("mysql", {})
     source_uri_template = datax_cfg.get("source_uri") or config.get("source", {}).get("uri", "")
@@ -549,12 +638,19 @@ def run_datax_for_db(db: str, config: Dict, workspace: str) -> int:
     if cleanup_on_finish:
         cleanup_datax_jobs_for_db(workspace, db, datax_cfg)
 
-    exclude_keywords = datax_cfg.get("exclude_table_keywords", [])
-    if not isinstance(exclude_keywords, list):
-        exclude_keywords = []
-    filtered_tables = [table for table in tables if not should_skip_table(table, exclude_keywords)]
-    skipped_by_rule = len(tables) - len(filtered_tables)
-    tables = filtered_tables
+    selected = parse_selected_tables(selected_tables)
+    skipped_by_rule = 0
+    if selected:
+        tables, missing_tables = filter_tables_by_selected(tables, selected)
+        if missing_tables:
+            print(f"DataX selected tables not found in {db}: {', '.join(missing_tables)}")
+    else:
+        exclude_keywords = datax_cfg.get("exclude_table_keywords", [])
+        if not isinstance(exclude_keywords, list):
+            exclude_keywords = []
+        filtered_tables = [table for table in tables if not should_skip_table(table, exclude_keywords)]
+        skipped_by_rule = len(tables) - len(filtered_tables)
+        tables = filtered_tables
 
     if not tables:
         print(f"DataX skipped: no tables left after exclude rule in {db}")
@@ -595,7 +691,7 @@ def run_datax_for_db(db: str, config: Dict, workspace: str) -> int:
         batch_size = int(datax_cfg.get("batch_size", 2000))
         split_pk_disp = split_pk if split_pk else "none"
         job_file = build_datax_job(workspace, db, table, columns, source_uri, target_uri, datax_cfg, split_pk=split_pk)
-        cmd = build_datax_command(job_file, datax_cfg)
+        cmd = build_datax_command(job_file, datax_cmd_cfg)
         with output_lock:
             print(f"DataX [{idx}/{len(tables)}] {db}.{table} (channel={channel}, batch={batch_size}, splitPk={split_pk_disp})")
 
@@ -647,10 +743,16 @@ def run_datax_for_db(db: str, config: Dict, workspace: str) -> int:
 
     if first_error is not None:
         code, table, tail, _ = first_error
+        tail_text = "".join(tail)
         sys.stdout.write(f"\nDataX failed table: {db}.{table}\n")
         sys.stdout.write("--- DataX output (last 200 lines) ---\n")
         sys.stdout.writelines(tail)
         sys.stdout.write("--- end ---\n")
+        if is_datax_jvm_oom(tail_text):
+            sys.stdout.write(
+                "Tip: DataX JVM 内存不足。请降低 datax.table_parallelism / datax.channel / datax.batch_size，"
+                "并将 datax.jvm 调小（如 -Xms256m -Xmx1024m）。\n"
+            )
         return code
 
     if cleanup_on_finish:
@@ -677,6 +779,7 @@ def run_pgloader_for_db(
     db: str,
     config: Dict,
     workspace: str,
+    selected_tables: Optional[List[str]] = None,
 ) -> int:
     mysql_cfg = config.get("mysql", {})
     pgloader_cfg = config["pgloader"]
@@ -684,20 +787,42 @@ def run_pgloader_for_db(
     target_cfg = config.get("target", {})
     source_type = source_cfg.get("type", "mysql")
 
+    selected = parse_selected_tables(selected_tables)
+
     if bool(pgloader_cfg.get("clear_public_before_sync", True)):
-        clear_code = clear_target_public_tables(db, config)
+        clear_code = clear_target_public_tables(db, config, selected_tables=selected)
         if clear_code != 0:
-            print(f"Failed to clear target public tables: {db}")
+            if selected:
+                print(f"Failed to clear selected target tables: {db}")
+            else:
+                print(f"Failed to clear target public tables: {db}")
             return clear_code
 
     total_tables = 0
+    table_filter_clause = ""
     if source_type == "mysql":
-        total_tables = get_total_tables(
-            mysql_cfg.get("container", ""),
-            mysql_cfg.get("user", ""),
-            mysql_cfg.get("password", ""),
-            db,
-        )
+        if selected:
+            all_tables = get_mysql_tables(
+                mysql_cfg.get("container", ""),
+                mysql_cfg.get("user", ""),
+                mysql_cfg.get("password", ""),
+                db,
+            )
+            selected_found, missing_tables = filter_tables_by_selected(all_tables, selected)
+            if missing_tables:
+                print(f"Selected tables not found in {db}: {', '.join(missing_tables)}")
+            if not selected_found:
+                print(f"No selected tables found in {db}, skip structure sync")
+                return 1
+            total_tables = len(selected_found)
+            table_filter_clause = build_pgloader_table_filter_clause(selected_found)
+        else:
+            total_tables = get_total_tables(
+                mysql_cfg.get("container", ""),
+                mysql_cfg.get("user", ""),
+                mysql_cfg.get("password", ""),
+                db,
+            )
 
     source_uri = source_cfg.get("uri", "").replace("{{DB_NAME}}", db)
     target_uri = target_cfg.get("uri", "").replace("{{DB_NAME}}", db)
@@ -716,6 +841,7 @@ def run_pgloader_for_db(
             "DB_NAME": db,
             "SOURCE_URI": source_uri,
             "TARGET_URI": target_uri,
+            "TABLE_FILTER": table_filter_clause,
         },
     )
 
@@ -800,6 +926,11 @@ def main() -> int:
         default="structure",
         help="Run only structure sync (pgloader) or only data sync (DataX)",
     )
+    parser.add_argument(
+        "--table",
+        action="append",
+        help="Table name to sync (can be repeated, and also supports comma-separated names)",
+    )
     args = parser.parse_args()
 
     workspace = os.path.abspath(os.path.dirname(__file__))
@@ -807,6 +938,12 @@ def main() -> int:
     cleanup_datax_logs_by_retention(workspace, config.get("datax", {}))
 
     databases = args.db if args.db else config.get("databases", [])
+    selected_tables = parse_selected_tables(args.table)
+
+    if selected_tables and len(databases) > 1:
+        print("When --table is specified, please sync one database at a time.")
+        return 1
+
     if not databases:
         print("No databases configured.")
         return 1
@@ -816,13 +953,13 @@ def main() -> int:
         print(f"Sync database: {db}")
         print("=" * 30)
         if args.action == "structure":
-            code = run_pgloader_for_db(db, config, workspace)
+            code = run_pgloader_for_db(db, config, workspace, selected_tables=selected_tables)
             if code != 0:
                 print(f"Structure sync failed: {db}")
                 return code
             print(f"Structure sync success: {db}")
         else:
-            code = run_datax_for_db(db, config, workspace)
+            code = run_datax_for_db(db, config, workspace, selected_tables=selected_tables)
             if code != 0:
                 print(f"Data sync failed: {db}")
                 return code

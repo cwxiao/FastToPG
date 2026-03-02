@@ -128,6 +128,21 @@ python .\pgloader_tool.py --action structure --db iucp_data --db iucp_normal
 python .\pgloader_tool.py --action data --db iucp_data --db iucp_normal
 ```
 
+单表/多表迁移示例（一次仅支持一个数据库）：
+
+```powershell
+python .\pgloader_tool.py --action structure --db iucp_normal --table user
+python .\pgloader_tool.py --action data --db iucp_normal --table user --table user_role
+python .\pgloader_tool.py --action data --db iucp_normal --table user,user_role,dept
+```
+
+GUI 中也支持单表/多表迁移：先选中一个数据库，点击“刷新表”，再在“源表（单库可多选）”中选择要迁移的表后执行同步。
+
+说明：
+- 若未选表，结构同步前仍会清理目标库 `public` 下全部表。
+- 若已选单表/多表，结构同步前只清理目标库 `public` 下对应的选中表。
+- 表较多时可使用 GUI 的“表过滤”搜索框，并支持“全选”“清空选择”。
+
 ## 7. 容器示例（本地演示场景）
 
 如果你在本地演示环境中需要快速起容器，可参考：

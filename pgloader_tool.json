@@ -1,7 +1,9 @@
 {
   "databases": [
-    "iucp_camunda",
+    "camunda7",
+    "enterprise_file_manager",
     "iucp_data",
+    "iucp_mdm",
     "iucp_nacos",
     "iucp_normal",
     "iucp_xxl_job"
@@ -12,7 +14,7 @@
     "uri": "mysql://fasttopg:FastToPG123@host.docker.internal:3306/{{DB_NAME}}"
   },
   "target": {
-    "uri": "postgresql://postgres:spxxWYZdev123@192.168.1.121:5432/{{DB_NAME}}",
+    "uri": "postgresql://transfer_user:fasttransfer123456@192.168.1.67:5432/{{DB_NAME}}",
     "psql_container": "postgres16"
   },
   "mysql": {
@@ -27,7 +29,6 @@
       "SBCL_DYNAMIC_SPACE_SIZE": "8192"
     },
     "clear_public_before_sync": true,
-    "cleanup_temp_files": true,
     "show_output": true
   },
   "datax": {
@@ -40,14 +41,14 @@
     "mysql_jdbc_params": "useSSL=false",
     "target_table_lowercase": true,
     "target_column_lowercase": true,
-    "exclude_table_keywords": [],
-    "table_parallelism": 30,
-    "channel": 6,
-    "batch_size": 10000,
+    "table_parallelism": 10,
+    "channel": 4,
+    "batch_size": 2000,
     "job_dir": ".datax_jobs",
     "cleanup_jobs_on_finish": true,
-    "compact_log": true,
     "show_output": true,
+    "compact_log": true,
+    "exclude_table_keywords": [],
     "log_retention_days": 7,
     "log_dirs": [
       "datax/datax/log",

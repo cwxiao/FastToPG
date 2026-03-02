@@ -2,6 +2,8 @@ LOAD DATABASE
      FROM {{SOURCE_URI}}
      INTO {{TARGET_URI}}
 
+{{TABLE_FILTER}}
+
 WITH
      schema only,
      include no drop,
