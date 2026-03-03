@@ -329,6 +329,178 @@ def get_mysql_columns(mysql_container: str, user: str, password: str, db: str, t
     return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 
 
+def get_mysql_primary_key_map(mysql_container: str, user: str, password: str, db: str) -> Dict[str, List[str]]:
+    cmd = [
+        "docker",
+        "exec",
+        mysql_container,
+        "mysql",
+        f"-u{user}",
+        f"-p{password}",
+        "-N",
+        "-e",
+        (
+            "SELECT tc.table_name, k.column_name "
+            "FROM information_schema.table_constraints tc "
+            "JOIN information_schema.key_column_usage k "
+            "ON tc.constraint_name = k.constraint_name "
+            "AND tc.table_schema = k.table_schema "
+            "AND tc.table_name = k.table_name "
+            f"WHERE tc.constraint_type='PRIMARY KEY' AND tc.table_schema='{db}' "
+            "ORDER BY tc.table_name, k.ordinal_position;"
+        ),
+    ]
+    result = run_command(cmd)
+    if result.returncode != 0:
+        return {}
+
+    pk_map: Dict[str, List[str]] = {}
+    for line in (result.stdout or "").splitlines():
+        row = line.strip()
+        if not row:
+            continue
+        parts = row.split("\t")
+        if len(parts) < 2:
+            continue
+        table_name = parts[0].strip()
+        column_name = parts[1].strip()
+        if not table_name or not column_name:
+            continue
+        pk_map.setdefault(table_name, []).append(column_name)
+    return pk_map
+
+
+def sql_quote_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def build_add_primary_keys_sql(pk_map: Dict[str, List[str]]) -> str:
+    blocks: List[str] = []
+    for table, columns in pk_map.items():
+        if not columns:
+            continue
+        table_literal = sql_quote_literal(table)
+        columns_sql = ", ".join(pg_quote_ident(col) for col in columns)
+        table_ident = pg_quote_ident(table)
+        blocks.append(
+            "DO $$ "
+            "BEGIN "
+            "IF EXISTS ("
+            "SELECT 1 FROM pg_class t JOIN pg_namespace n ON n.oid = t.relnamespace "
+            f"WHERE n.nspname='public' AND t.relname={table_literal}"
+            ") "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM pg_constraint c "
+            "JOIN pg_class t ON c.conrelid = t.oid "
+            "JOIN pg_namespace n ON n.oid = t.relnamespace "
+            f"WHERE n.nspname='public' AND t.relname={table_literal} AND c.contype='p'"
+            ") "
+            f"THEN ALTER TABLE public.{table_ident} ADD PRIMARY KEY ({columns_sql}); "
+            "END IF; "
+            "END $$;"
+        )
+    return "\n".join(blocks)
+
+
+def ensure_target_primary_keys(db: str, config: Dict, selected_tables: Optional[List[str]] = None) -> int:
+    mysql_cfg = config.get("mysql", {})
+    pk_map = get_mysql_primary_key_map(
+        mysql_cfg.get("container", ""),
+        mysql_cfg.get("user", ""),
+        mysql_cfg.get("password", ""),
+        db,
+    )
+    selected = parse_selected_tables(selected_tables)
+    if selected:
+        selected_keys = {name.lower() for name in selected}
+        pk_map = {table: cols for table, cols in pk_map.items() if table.lower() in selected_keys}
+
+    if not pk_map:
+        print(f"Primary key ensure skipped: no source primary keys found in {db}")
+        return 0
+
+    sql = build_add_primary_keys_sql(pk_map)
+    if not sql:
+        print(f"Primary key ensure skipped: no valid primary key statements for {db}")
+        return 0
+
+    target_cfg = config.get("target", {})
+    target_uri = target_cfg.get("uri", "").replace("{{DB_NAME}}", db)
+    target = parse_db_uri(target_uri)
+
+    if target.get("scheme") not in ("postgresql", "pgsql", "postgres"):
+        print(f"Skip ensure primary keys: unsupported target scheme {target.get('scheme')}")
+        return 1
+
+    pg_user = str(target.get("user", ""))
+    pg_db = str(target.get("database", ""))
+    pg_host = str(target.get("host", ""))
+    pg_port = str(target.get("port", 5432) or 5432)
+    psql_container = (target_cfg.get("psql_container") or "postgres16").strip()
+
+    print(f"Ensuring target primary keys: {target.get('database', '')}, tables={len(pk_map)}")
+    container_cmd = [
+        "docker",
+        "exec",
+        "-e",
+        f"PGPASSWORD={str(target.get('password', ''))}",
+        psql_container,
+        "psql",
+        "-h",
+        pg_host,
+        "-p",
+        pg_port,
+        "-U",
+        pg_user,
+        "-d",
+        pg_db,
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-q",
+        "-c",
+        sql,
+    ]
+
+    container_result = run_command(container_cmd)
+    if container_result.returncode == 0:
+        return 0
+
+    psql_cmd = target_cfg.get("psql", "psql")
+    local_cmd = [
+        psql_cmd,
+        "-h",
+        pg_host,
+        "-p",
+        pg_port,
+        "-U",
+        pg_user,
+        "-d",
+        pg_db,
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-q",
+        "-c",
+        sql,
+    ]
+
+    cmd_env = os.environ.copy()
+    password = str(target.get("password", ""))
+    if password:
+        cmd_env["PGPASSWORD"] = password
+
+    result = run_command(local_cmd, env=cmd_env)
+    if result.returncode != 0:
+        if container_result.stdout:
+            sys.stdout.write(container_result.stdout)
+        if container_result.stderr:
+            sys.stdout.write(container_result.stderr)
+        if result.stdout:
+            sys.stdout.write(result.stdout)
+        if result.stderr:
+            sys.stdout.write(result.stderr)
+    return result.returncode
+
+
 def get_mysql_split_pk(mysql_container: str, user: str, password: str, db: str, table: str) -> Optional[str]:
     cmd = [
         "docker",
@@ -904,6 +1076,14 @@ def run_pgloader_for_db(
                 "当前模板已移除 include drop 以降低锁压力；"
                 "如仍失败，请在目标库提升该参数并重启 PostgreSQL。\n"
             )
+        return code
+
+    ensure_pk_enabled = bool(pgloader_cfg.get("ensure_primary_keys", True))
+    if ensure_pk_enabled:
+        pk_code = ensure_target_primary_keys(db, config, selected_tables=selected)
+        if pk_code != 0:
+            print(f"Failed to ensure primary keys on target: {db}")
+            return pk_code
 
     return code
 

@@ -14,7 +14,7 @@
     "uri": "mysql://fasttopg:FastToPG123@host.docker.internal:3306/{{DB_NAME}}"
   },
   "target": {
-    "uri": "postgresql://transfer_user:fasttransfer123456@192.168.1.67:5432/{{DB_NAME}}",
+    "uri": "postgresql://postgres:spxxWYZdev123@192.168.1.121:5432/{{DB_NAME}}",
     "psql_container": "postgres16"
   },
   "mysql": {
