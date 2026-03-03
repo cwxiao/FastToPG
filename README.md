@@ -29,38 +29,61 @@ docker pull mysql:8.0.36
 docker pull postgres:16.4
 ```
 
-## 3. DataX 附件下载与目录结构
+## 3. DataX 下载与部署
 
-### 3.1 下载方式
+### 3.1 官方下载地址
 
-从 GitHub Release 的附件下载 DataX 工具包压缩文件（例如：`datax.tar.gz`，版本 `3.0.0`）。
+DataX 由阿里巴巴开源，从官方 GitHub Releases 下载预编译包：
 
-### 3.2 解压目标目录
+> **下载页面：** https://github.com/alibaba/DataX/releases
+>
+> 找到最新版本，下载 `datax.tar.gz`（Linux/macOS/Windows 通用）
 
-在项目根目录下解压，要求最终可执行路径为：
+直接链接示例（以某版本为例，建议以页面最新版为准）：
 
-```text
-datax/datax/bin/datax.py
+```
+https://github.com/alibaba/DataX/releases/download/datax_v202309/datax.tar.gz
 ```
 
-示例（PowerShell）：
+### 3.2 解压到项目相对目录
+
+**解压目标：** 项目根目录下的 `datax/` 子目录，最终结构如下：
+
+```text
+pgloader_tool/          ← 项目根目录（本仓库）
+└── datax/
+    └── datax/          ← 解压后的 DataX 包
+        ├── bin/
+        │   └── datax.py
+        ├── conf/
+        │   └── core.json
+        ├── plugin/
+        │   ├── reader/
+        │   └── writer/
+        ├── log/
+        └── log_perf/
+```
+
+**解压步骤（PowerShell，在项目根目录执行）：**
 
 ```powershell
+# 1. 创建 datax 目录
 New-Item -ItemType Directory -Force datax | Out-Null
+
+# 2. 解压（将 datax.tar.gz 放在项目根目录后执行）
 tar -xzf .\datax.tar.gz -C .\datax
+
+# 3. 验证路径是否正确
+Test-Path .\datax\datax\bin\datax.py
+# 输出 True 则正确
 ```
 
-如果解压后层级不一致，请手动调整到如下结构：
-
-```text
-datax/
-  datax/
-    bin/datax.py
-    conf/core.json
-    plugin/
-    log/
-    log_perf/
-```
+> ⚠️ 注意：`tar` 命令在 Windows 10 1803+ 内置可用。如果解压后目录层级是 `datax/bin/datax.py` 而非 `datax/datax/bin/datax.py`，需手动补一层：
+>
+> ```powershell
+> New-Item -ItemType Directory -Force datax\datax | Out-Null
+> tar -xzf .\datax.tar.gz -C .\datax\datax
+> ```
 
 ## 4. 前提准备清单
 
