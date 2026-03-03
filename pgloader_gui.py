@@ -13,6 +13,8 @@ from tkinter import ttk, messagebox, filedialog
 from urllib.parse import unquote, urlparse
 
 DEFAULT_CONFIG = "pgloader_tool.json"
+SYNC_HISTORY_FILE = "sync_history.json"
+URI_HISTORY_FILE = "uri_history.json"
 SOURCE_TYPES = ["mysql", "mssql", "sqlite", "pgsql", "redshift", "file"]
 
 
@@ -107,7 +109,15 @@ def save_config(path: str, config: dict) -> None:
 
 
 def run_command(cmd: list, env: dict | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, env=env, capture_output=True, text=True)
+    # Force UTF-8 decoding and replace invalid bytes to avoid locale decode errors from docker exec output
+    return subprocess.run(
+        cmd,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
 
 
 def get_total_tables(mysql_container: str, user: str, password: str, db: str) -> int:
@@ -153,6 +163,25 @@ def render_load_file(template_path: str, output_path: str, replacements: dict) -
         f.write(content)
 
 
+def patch_rendered_load_for_full_sync(path: str) -> None:
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        return
+
+    updated = re.sub(r"(^\s*)foreign\s+keys\s*,\s*$", r"\1no foreign keys,", content, flags=re.IGNORECASE | re.MULTILINE)
+    if updated == content:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(updated)
+    except Exception:
+        pass
+
+
 def build_pgloader_command(
     workspace: str,
     load_file: str,
@@ -188,6 +217,61 @@ def parse_db_uri(uri: str) -> dict:
 def pg_quote_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
+def _make_psql_exec_cmd(psql_container: str, pg_password: str, pg_host: str, pg_port: str,
+                         pg_user: str, pg_db: str, sql: str) -> list:
+    return [
+        "docker", "exec",
+        "-e", f"PGPASSWORD={pg_password}",
+        psql_container,
+        "psql",
+        "-h", pg_host,
+        "-p", pg_port,
+        "-U", pg_user,
+        "-d", pg_db,
+        "-v", "ON_ERROR_STOP=1",
+        "-q",
+        "-c", sql,
+    ]
+
+
+def run_psql_container_sql(target: dict, target_cfg: dict, sql: str) -> tuple[int, str]:
+    pg_user = str(target.get("user", ""))
+    pg_db = str(target.get("database", ""))
+    pg_host = str(target.get("host", ""))
+    pg_port = str(target.get("port", 5432) or 5432)
+    pg_password = str(target.get("password", ""))
+    psql_container = (target_cfg.get("psql_container") or "postgres16").strip()
+
+    # First try with the configured host
+    exec_cmd = _make_psql_exec_cmd(psql_container, pg_password, pg_host, pg_port, pg_user, pg_db, sql)
+    exec_result = run_command(exec_cmd)
+    if exec_result.returncode == 0:
+        return 0, (exec_result.stdout or "") + (exec_result.stderr or "")
+
+    first_error = (exec_result.stdout or "") + (exec_result.stderr or "")
+
+    # Only fallback to host.docker.internal if the failure is a connection error,
+    # not a SQL/auth error from PG itself (which means connection already worked).
+    is_conn_error = any(tok in first_error.lower() for tok in (
+        "could not connect", "connection to server", "connection refused",
+        "no route to host", "network is unreachable", "name or service not known",
+    ))
+
+    fallback_error = ""
+    if is_conn_error and pg_host not in ("host.docker.internal", "localhost", "127.0.0.1"):
+        fallback_cmd = _make_psql_exec_cmd(psql_container, pg_password, "host.docker.internal", pg_port, pg_user, pg_db, sql)
+        fallback_result = run_command(fallback_cmd)
+        if fallback_result.returncode == 0:
+            return 0, (fallback_result.stdout or "") + (fallback_result.stderr or "")
+        fallback_error = (fallback_result.stdout or "") + (fallback_result.stderr or "")
+
+    output_parts = [f"容器 psql（docker exec）执行失败，container={psql_container}。\n"]
+    if first_error.strip():
+        output_parts.append(f"  错误：{first_error.strip()}\n")
+    if fallback_error.strip():
+        output_parts.append(f"  尝试 host.docker.internal:{pg_port} 错误：{fallback_error.strip()}\n")
+    return exec_result.returncode, "".join(output_parts)
+
 
 def build_clear_public_sql(selected_tables: list[str] | None = None) -> str:
     selected = parse_selected_tables(selected_tables)
@@ -216,76 +300,16 @@ def clear_target_public_tables(db: str, config: dict, selected_tables: list[str]
 
     sql = build_clear_public_sql(selected_tables)
 
-    pg_user = str(target.get("user", ""))
-    pg_db = str(target.get("database", ""))
-    pg_host = str(target.get("host", ""))
-    pg_port = str(target.get("port", 5432) or 5432)
-    psql_container = (target_cfg.get("psql_container") or "postgres16").strip()
-
-    container_cmd = [
-        "docker",
-        "exec",
-        "-e",
-        f"PGPASSWORD={str(target.get('password', ''))}",
-        psql_container,
-        "psql",
-        "-h",
-        pg_host,
-        "-p",
-        pg_port,
-        "-U",
-        pg_user,
-        "-d",
-        pg_db,
-        "-v",
-        "ON_ERROR_STOP=1",
-        "-q",
-        "-c",
-        sql,
-    ]
     selected = parse_selected_tables(selected_tables)
     prefix = (
         f"Clearing selected target tables: {target.get('database', '')}, tables={len(selected)}\n"
         if selected
         else f"Clearing target public tables: {target.get('database', '')}\n"
     )
-
-    container_result = run_command(container_cmd)
-    if container_result.returncode == 0:
-        return 0, prefix + (container_result.stdout or "") + (container_result.stderr or "")
-
-    psql_cmd = target_cfg.get("psql", "psql")
-    local_cmd = [
-        psql_cmd,
-        "-h",
-        pg_host,
-        "-p",
-        pg_port,
-        "-U",
-        pg_user,
-        "-d",
-        pg_db,
-        "-v",
-        "ON_ERROR_STOP=1",
-        "-q",
-        "-c",
-        sql,
-    ]
-
-    cmd_env = os.environ.copy()
-    password = str(target.get("password", ""))
-    if password:
-        cmd_env["PGPASSWORD"] = password
-
-    result = run_command(local_cmd, env=cmd_env)
-    output = (
-        prefix
-        (container_result.stdout or "")
-        + (container_result.stderr or "")
-        + (result.stdout or "")
-        + (result.stderr or "")
-    )
-    return result.returncode, output
+    code, out = run_psql_container_sql(target, target_cfg, sql)
+    if code == 0:
+        return 0, prefix + out
+    return code, prefix + out
 
 
 def get_mysql_tables(mysql_container: str, user: str, password: str, db: str) -> list[str]:
@@ -328,6 +352,162 @@ def get_mysql_columns(mysql_container: str, user: str, password: str, db: str, t
     if result.returncode != 0:
         return []
     return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def get_mysql_primary_key_map(mysql_container: str, user: str, password: str, db: str) -> dict[str, list[str]]:
+    cmd = [
+        "docker",
+        "exec",
+        mysql_container,
+        "mysql",
+        f"-u{user}",
+        f"-p{password}",
+        "-N",
+        "-e",
+        (
+            "SELECT tc.table_name, k.column_name "
+            "FROM information_schema.table_constraints tc "
+            "JOIN information_schema.key_column_usage k "
+            "ON tc.constraint_name = k.constraint_name "
+            "AND tc.table_schema = k.table_schema "
+            "AND tc.table_name = k.table_name "
+            f"WHERE tc.constraint_type='PRIMARY KEY' AND tc.table_schema='{db}' "
+            "ORDER BY tc.table_name, k.ordinal_position;"
+        ),
+    ]
+    result = run_command(cmd)
+    if result.returncode != 0:
+        return {}
+
+    pk_map: dict[str, list[str]] = {}
+    for line in (result.stdout or "").splitlines():
+        row = line.strip()
+        if not row:
+            continue
+        parts = row.split("\t")
+        if len(parts) < 2:
+            continue
+        table_name = parts[0].strip()
+        column_name = parts[1].strip()
+        if not table_name or not column_name:
+            continue
+        pk_map.setdefault(table_name, []).append(column_name)
+    return pk_map
+
+
+def sql_quote_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def build_add_primary_keys_sql(pk_map: dict[str, list[str]]) -> str:
+    blocks: list[str] = []
+    for table, columns in pk_map.items():
+        if not columns:
+            continue
+        # pgloader lowercases all identifiers; match that when building PG SQL
+        pg_table = table.lower()
+        pg_columns = [col.lower() for col in columns]
+        table_literal = sql_quote_literal(pg_table)
+        table_ident = pg_quote_ident(pg_table)
+        columns_sql = ", ".join(pg_quote_ident(col) for col in pg_columns)
+        blocks.append(
+            "DO $$ "
+            "BEGIN "
+            "IF EXISTS ("
+            "SELECT 1 FROM pg_class t JOIN pg_namespace n ON n.oid = t.relnamespace "
+            f"WHERE n.nspname='public' AND t.relname={table_literal}"
+            ") "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM pg_constraint c "
+            "JOIN pg_class t ON c.conrelid = t.oid "
+            "JOIN pg_namespace n ON n.oid = t.relnamespace "
+            f"WHERE n.nspname='public' AND t.relname={table_literal} AND c.contype='p'"
+            ") "
+            f"THEN ALTER TABLE public.{table_ident} ADD PRIMARY KEY ({columns_sql}); "
+            "END IF; "
+            "END $$;"
+        )
+    return "\n".join(blocks)
+
+
+def ensure_target_primary_keys(db: str, config: dict, selected_tables: list[str] | None = None) -> tuple[int, str]:
+    mysql_cfg = config.get("mysql", {})
+    pk_map = get_mysql_primary_key_map(
+        mysql_cfg.get("container", ""),
+        mysql_cfg.get("user", ""),
+        mysql_cfg.get("password", ""),
+        db,
+    )
+    selected = parse_selected_tables(selected_tables)
+    if selected:
+        selected_keys = {name.lower() for name in selected}
+        pk_map = {table: cols for table, cols in pk_map.items() if table.lower() in selected_keys}
+
+    if not pk_map:
+        return 0, f"Primary key ensure skipped: no source primary keys found in {db}\n"
+
+    target_cfg = config.get("target", {})
+    target_uri = target_cfg.get("uri", "").replace("{{DB_NAME}}", db)
+    target = parse_db_uri(target_uri)
+
+    if target.get("scheme") not in ("postgresql", "pgsql", "postgres"):
+        return 1, f"Skip ensure primary keys: unsupported target scheme {target.get('scheme')}\n"
+
+    output_lines: list[str] = [f"Ensuring target primary keys: {target.get('database', '')}, tables={len(pk_map)}\n"]
+    for table, columns in pk_map.items():
+        sql = build_add_primary_keys_sql({table: columns})
+        if not sql:
+            continue
+
+        code, out = run_psql_container_sql(target, target_cfg, sql)
+        if code == 0:
+            continue
+
+        output_lines.append(f"Primary key ensure failed table: {table}\n")
+        output_lines.append(out)
+        return code, "".join(output_lines)
+
+    output_lines.append(f"Primary key ensure success: {db}\n")
+    return 0, "".join(output_lines)
+
+
+def build_clear_public_data_sql(selected_tables: list[str] | None = None) -> str:
+    selected = parse_selected_tables(selected_tables)
+    if not selected:
+        return (
+            "DO $$ "
+            "DECLARE r record; "
+            "BEGIN "
+            "FOR r IN SELECT tablename FROM pg_tables WHERE schemaname='public' LOOP "
+            "EXECUTE format('TRUNCATE TABLE public.%I RESTART IDENTITY CASCADE', r.tablename); "
+            "END LOOP; "
+            "END $$;"
+        )
+
+    stmts = [f"TRUNCATE TABLE public.{pg_quote_ident(table)} RESTART IDENTITY CASCADE;" for table in selected]
+    return "\n".join(stmts)
+
+
+def clear_target_public_table_data(db: str, config: dict, selected_tables: list[str] | None = None) -> tuple[int, str]:
+    target_cfg = config.get("target", {})
+    target_uri = target_cfg.get("uri", "").replace("{{DB_NAME}}", db)
+    target = parse_db_uri(target_uri)
+
+    if target.get("scheme") not in ("postgresql", "pgsql", "postgres"):
+        return 1, f"Skip clear public data: unsupported target scheme {target.get('scheme')}\n"
+
+    sql = build_clear_public_data_sql(selected_tables)
+
+    selected = parse_selected_tables(selected_tables)
+    prefix = (
+        f"清理目标库选中表数据: {target.get('database', '')}，tables={len(selected)}\n"
+        if selected
+        else f"清理目标库全表数据: {target.get('database', '')}\n"
+    )
+    code, out = run_psql_container_sql(target, target_cfg, sql)
+    if code == 0:
+        return 0, prefix + out
+    return code, prefix + out
 
 
 def get_mysql_split_pk(mysql_container: str, user: str, password: str, db: str, table: str) -> str | None:
@@ -678,12 +858,21 @@ class PgloaderGUI(tk.Tk):
         self.table_all_items: list[str] = []
         self.info_refresh_after_id: str | None = None
         self.fallback_databases: list[str] = []
+        self.full_sync_dbs: list[str] = []
+        self.sync_history_path = os.path.join(self.workspace, SYNC_HISTORY_FILE)
+        self.sync_history_records: list[dict] = []
+        self.uri_history_path = os.path.join(self.workspace, URI_HISTORY_FILE)
+        self.uri_history_records: list[str] = []
+        self.current_mode = ""
+        self.eta_task_total = 0
+        self.eta_task_done = 0
 
         self.config_path = tk.StringVar(value=os.path.join(self.workspace, DEFAULT_CONFIG))
         self.load_template = tk.StringVar()
         self.source_type = tk.StringVar(value="mysql")
         self.source_uri = tk.StringVar()
         self.target_uri = tk.StringVar()
+        self.target_psql_container = tk.StringVar(value="postgres16")
         self.mysql_container = tk.StringVar()
         self.mysql_user = tk.StringVar()
         self.mysql_password = tk.StringVar()
@@ -701,6 +890,8 @@ class PgloaderGUI(tk.Tk):
         self.table_filter_keyword = tk.StringVar(value="")
 
         self._build_ui()
+        self._load_uri_history_records()
+        self._load_sync_history_records()
         self._load_config_safe()
         self._poll_queue()
 
@@ -713,8 +904,10 @@ class PgloaderGUI(tk.Tk):
 
         home_tab = ttk.Frame(tabs)
         config_tab = ttk.Frame(tabs)
+        history_tab = ttk.Frame(tabs)
         tabs.add(home_tab, text="主页")
         tabs.add(config_tab, text="配置")
+        tabs.add(history_tab, text="同步历史记录")
 
         home_pane = ttk.Panedwindow(home_tab, orient=tk.HORIZONTAL)
         home_pane.pack(fill=tk.BOTH, expand=True)
@@ -729,17 +922,36 @@ class PgloaderGUI(tk.Tk):
         db_frame = ttk.LabelFrame(left, text="源数据库")
         db_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        self.db_list = tk.Listbox(db_frame, selectmode=tk.EXTENDED)
+        db_left = ttk.Frame(db_frame)
+        db_left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.db_list = tk.Listbox(db_left, selectmode=tk.EXTENDED)
         self.db_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.db_list.bind("<<ListboxSelect>>", self._on_db_select)
-        db_scroll = ttk.Scrollbar(db_frame, command=self.db_list.yview)
+        db_scroll = ttk.Scrollbar(db_left, command=self.db_list.yview)
         db_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.db_list.configure(yscrollcommand=db_scroll.set)
+
+        db_mid = ttk.Frame(db_frame, width=56)
+        db_mid.pack(side=tk.LEFT, fill=tk.Y, padx=2)
+        self.full_add_btn = ttk.Button(db_mid, text=">>", width=4, command=self._add_to_full_sync)
+        self.full_add_btn.pack(pady=(26, 6))
+        self.full_remove_btn = ttk.Button(db_mid, text="<<", width=4, command=self._remove_from_full_sync)
+        self.full_remove_btn.pack(pady=6)
+
+        db_right = ttk.LabelFrame(db_frame, text="全同步数据库池")
+        db_right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(2, 5), pady=5)
+        self.full_sync_list = tk.Listbox(db_right, selectmode=tk.EXTENDED)
+        self.full_sync_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        full_scroll = ttk.Scrollbar(db_right, command=self.full_sync_list.yview)
+        full_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.full_sync_list.configure(yscrollcommand=full_scroll.set)
 
         db_buttons = ttk.Frame(left)
         db_buttons.pack(fill=tk.X, padx=5, pady=5)
         self.db_refresh_btn = ttk.Button(db_buttons, text="刷新数据库", command=self._refresh_databases)
         self.db_refresh_btn.pack(side=tk.LEFT)
+        self.full_clear_btn = ttk.Button(db_buttons, text="清空全同步池", command=self._clear_full_sync_pool)
+        self.full_clear_btn.pack(side=tk.LEFT, padx=5)
 
         table_frame = ttk.LabelFrame(left, text="源表（单库可多选）")
         table_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
@@ -793,6 +1005,8 @@ class PgloaderGUI(tk.Tk):
         self.run_structure_button.pack(side=tk.LEFT)
         self.run_data_button = ttk.Button(bottom, text="同步数据", command=lambda: self._run_selected("data"))
         self.run_data_button.pack(side=tk.LEFT, padx=5)
+        self.run_full_button = ttk.Button(bottom, text="全同步", command=lambda: self._run_selected("full"))
+        self.run_full_button.pack(side=tk.LEFT, padx=5)
         self.stop_button = ttk.Button(bottom, text="停止", command=self._stop_run, state=tk.DISABLED)
         self.stop_button.pack(side=tk.LEFT, padx=5)
 
@@ -840,11 +1054,25 @@ class PgloaderGUI(tk.Tk):
         ttk.Label(settings, text="源连接 URI").grid(row=row, column=0, sticky="w")
         self.source_uri_entry = ttk.Entry(settings, textvariable=self.source_uri)
         self.source_uri_entry.grid(row=row, column=1, sticky="we", padx=5, pady=2)
+        self.source_uri_history_btn = ttk.Button(
+            settings,
+            text="历史",
+            width=6,
+            command=lambda: self._open_uri_history_dialog(self.source_uri),
+        )
+        self.source_uri_history_btn.grid(row=row, column=2, padx=(0, 5), pady=2)
         row += 1
 
         ttk.Label(settings, text="目标连接 URI").grid(row=row, column=0, sticky="w")
         self.target_uri_entry = ttk.Entry(settings, textvariable=self.target_uri)
         self.target_uri_entry.grid(row=row, column=1, sticky="we", padx=5, pady=2)
+        self.target_uri_history_btn = ttk.Button(
+            settings,
+            text="历史",
+            width=6,
+            command=lambda: self._open_uri_history_dialog(self.target_uri),
+        )
+        self.target_uri_history_btn.grid(row=row, column=2, padx=(0, 5), pady=2)
         row += 1
 
         ttk.Label(settings, text="MySQL 容器").grid(row=row, column=0, sticky="w")
@@ -885,6 +1113,13 @@ class PgloaderGUI(tk.Tk):
         ttk.Label(settings, text="DataX 源URI").grid(row=row, column=0, sticky="w")
         self.datax_source_uri_entry = ttk.Entry(settings, textvariable=self.datax_source_uri)
         self.datax_source_uri_entry.grid(row=row, column=1, sticky="we", padx=5, pady=2)
+        self.datax_source_uri_history_btn = ttk.Button(
+            settings,
+            text="历史",
+            width=6,
+            command=lambda: self._open_uri_history_dialog(self.datax_source_uri),
+        )
+        self.datax_source_uri_history_btn.grid(row=row, column=2, padx=(0, 5), pady=2)
         row += 1
 
         ttk.Label(settings, text="DataX 并发通道").grid(row=row, column=0, sticky="w")
@@ -932,6 +1167,32 @@ class PgloaderGUI(tk.Tk):
 
         settings.columnconfigure(1, weight=1)
 
+        history_frame = ttk.LabelFrame(history_tab, text="当前机器同步历史")
+        history_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        history_actions = ttk.Frame(history_tab)
+        history_actions.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self.history_clear_btn = ttk.Button(history_actions, text="清空历史", command=self._clear_sync_history)
+        self.history_clear_btn.pack(side=tk.RIGHT)
+
+        columns = ("source_db", "target_db", "sync_time", "result", "duration")
+        self.history_tree = ttk.Treeview(history_frame, columns=columns, show="headings")
+        self.history_tree.heading("source_db", text="源数据库")
+        self.history_tree.heading("target_db", text="目标数据库")
+        self.history_tree.heading("sync_time", text="同步时间")
+        self.history_tree.heading("result", text="同步结果")
+        self.history_tree.heading("duration", text="同步耗时")
+        self.history_tree.column("source_db", width=260, anchor=tk.W)
+        self.history_tree.column("target_db", width=260, anchor=tk.W)
+        self.history_tree.column("sync_time", width=180, anchor=tk.CENTER)
+        self.history_tree.column("result", width=120, anchor=tk.CENTER)
+        self.history_tree.column("duration", width=120, anchor=tk.CENTER)
+        self.history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        history_scroll = ttk.Scrollbar(history_frame, command=self.history_tree.yview)
+        history_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.history_tree.configure(yscrollcommand=history_scroll.set)
+
     def _browse_config(self) -> None:
         path = filedialog.askopenfilename(initialdir=self.workspace, filetypes=[("JSON", "*.json")])
         if path:
@@ -955,6 +1216,7 @@ class PgloaderGUI(tk.Tk):
         self.source_type.set(source_cfg.get("type", "mysql"))
         self.source_uri.set(source_cfg.get("uri", ""))
         self.target_uri.set(target_cfg.get("uri", ""))
+        self.target_psql_container.set((target_cfg.get("psql_container") or "postgres16").strip())
         mysql_cfg = config.get("mysql", {})
         self.mysql_container.set(mysql_cfg.get("container", "mysql8"))
         self.mysql_user.set(mysql_cfg.get("user", "root"))
@@ -1013,7 +1275,7 @@ class PgloaderGUI(tk.Tk):
             },
             "target": {
                 "uri": self.target_uri.get().strip(),
-                "psql_container": "postgres16",
+                "psql_container": self.target_psql_container.get().strip() or "postgres16",
             },
             "mysql": {
                 "container": self.mysql_container.get().strip(),
@@ -1056,6 +1318,10 @@ class PgloaderGUI(tk.Tk):
             messagebox.showerror("错误", f"保存配置失败: {exc}")
             return
 
+        self._remember_uri(config["source"].get("uri", ""))
+        self._remember_uri(config["target"].get("uri", ""))
+        self._remember_uri(config.get("datax", {}).get("source_uri", ""))
+
         messagebox.showinfo("已保存", "配置已保存。")
 
     def _add_db(self) -> None:
@@ -1072,18 +1338,25 @@ class PgloaderGUI(tk.Tk):
             messagebox.showwarning("运行中", "当前正在同步，请先完成或停止。")
             return
 
-        if mode == "structure" and not self._confirm_structure_sync():
+        if mode in ("structure", "full") and not self._confirm_structure_sync():
             return
 
-        dbs = [self.db_list.get(i) for i in self.db_list.curselection()]
-        if not dbs:
-            messagebox.showinfo("请选择", "请至少选择一个数据库。")
-            return
+        if mode == "full":
+            dbs = list(self.full_sync_list.get(0, tk.END))
+            if not dbs:
+                messagebox.showinfo("请选择", "请先将数据库加入全同步数据库池。")
+                return
+            selected_tables: list[str] = []
+        else:
+            dbs = [self.db_list.get(i) for i in self.db_list.curselection()]
+            if not dbs:
+                messagebox.showinfo("请选择", "请至少选择一个数据库。")
+                return
 
-        selected_tables = parse_selected_tables(self.selected_tables)
-        if selected_tables and len(dbs) != 1:
-            messagebox.showerror("错误", "选择单表/多表迁移时，只能选择一个数据库。")
-            return
+            selected_tables = parse_selected_tables(self.selected_tables)
+            if selected_tables and len(dbs) != 1:
+                messagebox.showerror("错误", "选择单表/多表迁移时，只能选择一个数据库。")
+                return
 
         try:
             env = json.loads(self.env_text.get("1.0", tk.END).strip() or "{}")
@@ -1117,7 +1390,7 @@ class PgloaderGUI(tk.Tk):
             },
             "target": {
                 "uri": self.target_uri.get().strip(),
-                "psql_container": "postgres16",
+                "psql_container": self.target_psql_container.get().strip() or "postgres16",
             },
             "mysql": {
                 "container": self.mysql_container.get().strip(),
@@ -1129,6 +1402,7 @@ class PgloaderGUI(tk.Tk):
                 "env": env,
                 "clear_public_before_sync": True,
                 "show_output": True,
+                "clear_table_data_before_data_sync": bool(mode == "full"),
             },
             "datax": {
                 "enabled": bool(self.datax_enabled.get()),
@@ -1154,11 +1428,16 @@ class PgloaderGUI(tk.Tk):
             },
         }
 
+        self._remember_uri(config["source"].get("uri", ""))
+        self._remember_uri(config["target"].get("uri", ""))
+        self._remember_uri(config.get("datax", {}).get("source_uri", ""))
+
         self.run_structure_button.configure(state=tk.DISABLED)
         self.run_data_button.configure(state=tk.DISABLED)
+        self.run_full_button.configure(state=tk.DISABLED)
         self.stop_button.configure(state=tk.NORMAL)
         self.progress.configure(value=0)
-        title = "结构同步" if mode == "structure" else "数据同步"
+        title = "结构同步" if mode == "structure" else ("数据同步" if mode == "data" else "全同步")
         self.progress_label.configure(text=f"{title} 启动中...")
         self.eta_label.configure(text="预计剩余: --")
         self.size_label.configure(text="已选数据库大小: --")
@@ -1166,6 +1445,9 @@ class PgloaderGUI(tk.Tk):
         self.stop_event.clear()
         self.overall_total_tables = 0
         self.overall_processed_tables = 0
+        self.current_mode = mode
+        self.eta_task_total = len(dbs) * (3 if mode == "full" else 1)
+        self.eta_task_done = 0
         self.start_time = time.time()
         self.last_progress_time = self.start_time
         self.last_progress_count = 0
@@ -1203,36 +1485,83 @@ class PgloaderGUI(tk.Tk):
             if selected_tables and total_dbs != 1:
                 self.queue.put(("failed", "选择单表/多表迁移时，只能选择一个数据库。\n"))
                 return
-            if mode == "structure":
-                for db in config["databases"]:
-                    source_type = config.get("source", {}).get("type", "mysql")
-                    if source_type == "mysql":
-                        mysql_cfg = config["mysql"]
-                        if selected_tables:
-                            all_tables = get_mysql_tables(
-                                mysql_cfg["container"],
-                                mysql_cfg["user"],
-                                mysql_cfg["password"],
-                                db,
-                            )
-                            selected_found, _ = filter_tables_by_selected(all_tables, selected_tables)
-                            self.overall_total_tables += len(selected_found)
-                        else:
-                            self.overall_total_tables += get_total_tables(
-                                mysql_cfg["container"],
-                                mysql_cfg["user"],
-                                mysql_cfg["password"],
-                                db,
-                            )
 
-            for idx, db in enumerate(config["databases"], start=1):
+            if mode in ("structure", "full"):
+                for db in config["databases"]:
+                    if config.get("source", {}).get("type", "mysql") != "mysql":
+                        continue
+                    mysql_cfg = config["mysql"]
+                    if selected_tables:
+                        all_tables = get_mysql_tables(mysql_cfg["container"], mysql_cfg["user"], mysql_cfg["password"], db)
+                        selected_found, _ = filter_tables_by_selected(all_tables, selected_tables)
+                        self.overall_total_tables += len(selected_found)
+                    else:
+                        self.overall_total_tables += get_total_tables(
+                            mysql_cfg["container"],
+                            mysql_cfg["user"],
+                            mysql_cfg["password"],
+                            db,
+                        )
+
+            if mode == "full":
+                execution_items = []
+                for db in config["databases"]:
+                    execution_items.append((db, "structure"))
+                    execution_items.append((db, "primary_key"))
+                    execution_items.append((db, "data"))
+            elif mode == "structure":
+                execution_items = [(db, "structure") for db in config["databases"]]
+            else:
+                execution_items = [(db, "data") for db in config["databases"]]
+
+            for db, phase in execution_items:
+                idx = config["databases"].index(db) + 1
                 if self.stop_event.is_set():
                     self.queue.put(("stopped",))
                     return
-                title = "结构同步" if mode == "structure" else "数据同步"
+
+                if mode == "full":
+                    if phase == "structure":
+                        phase_name = "结构同步"
+                    elif phase == "primary_key":
+                        phase_name = "主键同步"
+                    else:
+                        phase_name = "数据同步"
+                    self.queue.put(("log", f"\n>>>> 全同步阶段：{db} - {phase_name} <<<<\n"))
+
+                db_start_time = time.time()
+
+                def push_db_history(result: str) -> None:
+                    target_db = ""
+                    target_uri = config.get("target", {}).get("uri", "")
+                    if isinstance(target_uri, str) and target_uri.strip():
+                        try:
+                            parsed = parse_db_uri(target_uri.replace("{{DB_NAME}}", db))
+                            target_db = str(parsed.get("database", "") or "")
+                        except Exception:
+                            target_db = ""
+                    duration_seconds = max(0.0, time.time() - db_start_time)
+                    sync_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(db_start_time))
+                    self.queue.put((
+                        "history",
+                        {
+                            "source_db": db,
+                            "target_db": target_db,
+                            "sync_time": sync_time,
+                            "result": result,
+                            "duration_seconds": duration_seconds,
+                        },
+                    ))
+
+                if phase == "structure":
+                    title = "结构同步"
+                elif phase == "primary_key":
+                    title = "主键同步"
+                else:
+                    title = "数据同步"
                 self.queue.put(("log", f"===============================\n开始{title}数据库: {db}\n===============================\n"))
 
-                if mode == "structure":
+                if phase == "structure":
                     if bool(config.get("pgloader", {}).get("clear_public_before_sync", True)):
                         if selected_tables:
                             self.queue.put(("log", f"清理目标库选中表: {db}，tables={len(selected_tables)}\n"))
@@ -1242,10 +1571,8 @@ class PgloaderGUI(tk.Tk):
                         if clear_output:
                             self.queue.put(("log", clear_output + ("" if clear_output.endswith("\n") else "\n")))
                         if clear_code != 0:
-                            if selected_tables:
-                                self.queue.put(("failed", f"清理目标库选中表失败: {db}\n"))
-                            else:
-                                self.queue.put(("failed", f"清理目标库 public 表失败: {db}\n"))
+                            push_db_history("失败")
+                            self.queue.put(("failed", f"清理目标库 public 表失败: {db}\n"))
                             return
 
                     mysql_cfg = config["mysql"]
@@ -1264,6 +1591,7 @@ class PgloaderGUI(tk.Tk):
                             if missing_tables:
                                 self.queue.put(("log", f"选中表在 {db} 中不存在: {', '.join(missing_tables)}\n"))
                             if not selected_found:
+                                push_db_history("失败")
                                 self.queue.put(("failed", f"未找到可迁移表: {db}\n"))
                                 return
                             total_tables = len(selected_found)
@@ -1295,6 +1623,9 @@ class PgloaderGUI(tk.Tk):
                             "TABLE_FILTER": table_filter_clause,
                         },
                     )
+                    if mode == "full":
+                        patch_rendered_load_for_full_sync(rendered_path)
+                        self.queue.put(("log", "全同步结构阶段：已禁用外键创建，按 结构->主键->数据 顺序执行。\n"))
 
                     cmd = build_pgloader_command(
                         workspace=self.workspace,
@@ -1328,6 +1659,7 @@ class PgloaderGUI(tk.Tk):
                                     process.terminate()
                                 except Exception:
                                     pass
+                                push_db_history("已停止")
                                 self.queue.put(("stopped",))
                                 return
                             tail.append(line)
@@ -1339,7 +1671,6 @@ class PgloaderGUI(tk.Tk):
                                 processed += 1
                                 self.overall_processed_tables += 1
                                 self.queue.put(("progress", db, processed, total_tables, idx, total_dbs, self.overall_processed_tables, self.overall_total_tables))
-
                         code = process.wait()
                     finally:
                         if cleanup_pgloader_temp:
@@ -1349,18 +1680,56 @@ class PgloaderGUI(tk.Tk):
                         code = 1
                     self.current_process = None
                     if code != 0:
+                        push_db_history("失败")
                         self.queue.put(("error", db, list(tail)))
                         return
+
+                    ensure_pk_enabled = bool(config.get("pgloader", {}).get("ensure_primary_keys", True))
+                    if ensure_pk_enabled and mode != "full":
+                        pk_code, pk_output = ensure_target_primary_keys(db, config, selected_tables=selected_tables)
+                        if pk_output:
+                            self.queue.put(("log", pk_output + ("" if pk_output.endswith("\n") else "\n")))
+                        if pk_code != 0:
+                            push_db_history("失败")
+                            self.queue.put(("failed", f"补主键失败: {db}\n"))
+                            return
+
+                    push_db_history("成功")
                     self.queue.put(("log", f"结构同步成功: {db}\n"))
+                    self.queue.put(("phase_done",))
+                elif phase == "primary_key":
+                    ensure_pk_enabled = bool(config.get("pgloader", {}).get("ensure_primary_keys", True))
+                    if ensure_pk_enabled:
+                        pk_code, pk_output = ensure_target_primary_keys(db, config, selected_tables=selected_tables)
+                        if pk_output:
+                            self.queue.put(("log", pk_output + ("" if pk_output.endswith("\n") else "\n")))
+                        if pk_code != 0:
+                            push_db_history("失败")
+                            self.queue.put(("failed", f"补主键失败: {db}\n"))
+                            return
+                    push_db_history("成功")
+                    self.queue.put(("log", f"主键同步成功: {db}\n"))
+                    self.queue.put(("phase_done",))
                 else:
+                    if bool(config.get("pgloader", {}).get("clear_table_data_before_data_sync", False)):
+                        clear_data_code, clear_data_output = clear_target_public_table_data(db, config, selected_tables=None)
+                        if clear_data_output:
+                            self.queue.put(("log", clear_data_output + ("" if clear_data_output.endswith("\n") else "\n")))
+                        if clear_data_code != 0:
+                            push_db_history("失败")
+                            self.queue.put(("failed", f"清理目标库表数据失败: {db}\n"))
+                            return
+
                     datax_cfg = config.get("datax", {})
                     if not bool(datax_cfg.get("enabled", False)):
+                        push_db_history("失败")
                         self.queue.put(("failed", "DataX 未启用，请先勾选 DataX 启用。\n"))
                         return
 
                     datax_home = resolve_datax_home(self.workspace, datax_cfg)
                     datax_py = os.path.join(datax_home, "bin", "datax.py")
                     if not datax_home or not os.path.isfile(datax_py):
+                        push_db_history("失败")
                         self.queue.put((
                             "failed",
                             f"DataX 配置无效，未找到: {datax_py}\n"
@@ -1402,7 +1771,6 @@ class PgloaderGUI(tk.Tk):
                         self.queue.put(("log", f"DataX start: {db}, tables={len(tables)}\n"))
                         show_output_datax = bool(datax_cfg.get("show_output", False))
                         compact_log = bool(datax_cfg.get("compact_log", True))
-
                         table_parallelism = max(1, int(datax_cfg.get("table_parallelism", 3)))
                         self.queue.put(("log", f"DataX table parallelism: {table_parallelism}\n"))
                         process_lock = threading.Lock()
@@ -1410,7 +1778,6 @@ class PgloaderGUI(tk.Tk):
                         def run_one_table(t_idx: int, table: str) -> tuple[int, str, str, str]:
                             if self.stop_event.is_set():
                                 return 130, table, "", ""
-
                             columns = get_mysql_columns(
                                 mysql_cfg.get("container", ""),
                                 mysql_cfg.get("user", ""),
@@ -1432,7 +1799,6 @@ class PgloaderGUI(tk.Tk):
                             channel = int(datax_cfg.get("channel", 2))
                             batch_size = int(datax_cfg.get("batch_size", 2000))
                             split_pk_disp = split_pk if split_pk else "none"
-
                             job_file = build_datax_job(self.workspace, db, table, columns, source_uri, target_uri, datax_cfg, split_pk=split_pk)
                             cmd_datax = build_datax_command(job_file, datax_cmd_cfg)
                             self.queue.put(("log", f"DataX [{t_idx}/{len(tables)}] {db}.{table} (channel={channel}, batch={batch_size}, splitPk={split_pk_disp})\n"))
@@ -1472,7 +1838,6 @@ class PgloaderGUI(tk.Tk):
                                                 self.queue.put(("log", line))
                                         else:
                                             self.queue.put(("log", line))
-
                                 dcode = process.wait()
                             finally:
                                 with process_lock:
@@ -1495,14 +1860,15 @@ class PgloaderGUI(tk.Tk):
                                 for t_idx, table in enumerate(tables, start=1)
                             }
                             for future in as_completed(futures):
-                                dcode, failed_table, detail, job_file = future.result()
+                                dcode, failed_table, detail, _ = future.result()
                                 if dcode == 130:
                                     for pending in futures:
                                         pending.cancel()
+                                    push_db_history("已停止")
                                     self.queue.put(("stopped",))
                                     return
                                 if dcode != 0 and first_error is None:
-                                    first_error = (dcode, failed_table, detail, job_file)
+                                    first_error = (dcode, failed_table, detail, "")
                                     self.stop_event.set()
                                     for pending in futures:
                                         pending.cancel()
@@ -1517,13 +1883,17 @@ class PgloaderGUI(tk.Tk):
                                     "Tip: DataX JVM 内存不足，请降低 DataX 表并行/通道/批大小，"
                                     "并将 JVM 调小（如 -Xms256m -Xmx1024m）。\n"
                                 )
+                            push_db_history("失败")
                             self.queue.put(("failed", f"\nDataX failed table: {db}.{failed_table}\n--- DataX output (last 200 lines) ---\n{detail}--- end ---\n{tip}"))
                             return
 
                         if cleanup_on_finish:
                             cleanup_empty_datax_job_dir(self.workspace, datax_cfg)
-
                         self.queue.put(("log", f"DataX success: {db}\n"))
+
+                    if not self.stop_event.is_set():
+                        push_db_history("成功")
+                        self.queue.put(("phase_done",))
 
             self.queue.put(("done",))
         except Exception as exc:
@@ -1551,6 +1921,9 @@ class PgloaderGUI(tk.Tk):
             self.db_list.delete(0, tk.END)
             for db in dbs:
                 self.db_list.insert(tk.END, db)
+            db_keys = {db.lower() for db in dbs}
+            self.full_sync_dbs = [db for db in self.full_sync_dbs if db.lower() in db_keys]
+            self._refresh_full_sync_list_widget()
             self.selected_dbs = []
             for idx, db in enumerate(dbs):
                 if db in keep_selected:
@@ -1578,8 +1951,10 @@ class PgloaderGUI(tk.Tk):
                 self.progress_label.configure(text=f"{db}: {percent}% ({processed}/{total}) [DB {idx}/{total_dbs}]")
             else:
                 self.progress_label.configure(text=f"{db}: {processed} tables [DB {idx}/{total_dbs}]")
-
-            self._update_eta(overall_done, overall_total)
+            if self.current_mode == "full":
+                self._update_eta(self.eta_task_done, self.eta_task_total)
+            else:
+                self._update_eta(overall_done, overall_total)
         elif kind == "error":
             db, tail = msg[1], msg[2]
             self.log_text.insert(tk.END, f"\n同步失败: {db}\n")
@@ -1609,6 +1984,11 @@ class PgloaderGUI(tk.Tk):
         elif kind == "size":
             total_bytes = msg[1]
             self.size_label.configure(text=f"已选数据库大小: {self._format_size(total_bytes)}")
+        elif kind == "history":
+            self._append_sync_history_record(msg[1])
+        elif kind == "phase_done":
+            self.eta_task_done = min(self.eta_task_total, self.eta_task_done + 1)
+            self._update_eta(self.eta_task_done, self.eta_task_total)
 
     def _set_idle(self) -> None:
         self.progress.stop()
@@ -1618,10 +1998,14 @@ class PgloaderGUI(tk.Tk):
         self.size_label.configure(text="已选数据库大小: --")
         self.run_structure_button.configure(state=tk.NORMAL)
         self.run_data_button.configure(state=tk.NORMAL)
+        self.run_full_button.configure(state=tk.NORMAL)
         self.stop_button.configure(state=tk.DISABLED)
         self.current_process = None
         self.active_processes.clear()
         self.stop_event.clear()
+        self.current_mode = ""
+        self.eta_task_total = 0
+        self.eta_task_done = 0
         self._set_controls_running(False)
 
     def _trim_log_lines(self) -> None:
@@ -1690,22 +2074,22 @@ class PgloaderGUI(tk.Tk):
 
     def _update_eta(self, done: int, total: int) -> None:
         if total <= 0:
-            self.eta_label.configure(text="ETA: --")
+            self.eta_label.configure(text="预计剩余: --")
             return
 
         now = time.time()
         if done <= 0:
-            self.eta_label.configure(text="ETA: --")
+            self.eta_label.configure(text="预计剩余: --")
             return
 
         elapsed = now - self.start_time
         if elapsed <= 0:
-            self.eta_label.configure(text="ETA: --")
+            self.eta_label.configure(text="预计剩余: --")
             return
 
         rate = done / elapsed
         if rate <= 0:
-            self.eta_label.configure(text="ETA: --")
+            self.eta_label.configure(text="预计剩余: --")
             return
 
         remaining = total - done
@@ -1726,10 +2110,15 @@ class PgloaderGUI(tk.Tk):
         state = tk.DISABLED if running else tk.NORMAL
         self.run_structure_button.configure(state=tk.DISABLED if running else tk.NORMAL)
         self.run_data_button.configure(state=tk.DISABLED if running else tk.NORMAL)
+        self.run_full_button.configure(state=tk.DISABLED if running else tk.NORMAL)
         self.stop_button.configure(state=tk.NORMAL if running else tk.DISABLED)
 
         self.db_list.configure(state=state)
+        self.full_sync_list.configure(state=state)
         self.db_refresh_btn.configure(state=state)
+        self.full_add_btn.configure(state=state)
+        self.full_remove_btn.configure(state=state)
+        self.full_clear_btn.configure(state=state)
         self.table_list.configure(state=state)
         self.table_refresh_btn.configure(state=state)
         self.table_select_all_btn.configure(state=state)
@@ -1744,7 +2133,9 @@ class PgloaderGUI(tk.Tk):
         self.load_template_entry.configure(state=state)
         self.source_type_combo.configure(state=state)
         self.source_uri_entry.configure(state=state)
+        self.source_uri_history_btn.configure(state=state)
         self.target_uri_entry.configure(state=state)
+        self.target_uri_history_btn.configure(state=state)
         self.mysql_container_entry.configure(state=state)
         self.mysql_user_entry.configure(state=state)
         self.mysql_password_entry.configure(state=state)
@@ -1753,6 +2144,7 @@ class PgloaderGUI(tk.Tk):
         self.datax_home_entry.configure(state=state)
         self.datax_python_entry.configure(state=state)
         self.datax_source_uri_entry.configure(state=state)
+        self.datax_source_uri_history_btn.configure(state=state)
         self.datax_channel_entry.configure(state=state)
         self.datax_batch_size_entry.configure(state=state)
         self.datax_table_parallelism_entry.configure(state=state)
@@ -1798,6 +2190,39 @@ class PgloaderGUI(tk.Tk):
             keep.discard(table)
         keep.update(selected_visible)
         self.selected_tables = [table for table in self.table_all_items if table in keep]
+
+    def _refresh_full_sync_list_widget(self) -> None:
+        self.full_sync_list.delete(0, tk.END)
+        for db in self.full_sync_dbs:
+            self.full_sync_list.insert(tk.END, db)
+
+    def _add_to_full_sync(self) -> None:
+        selected = [self.db_list.get(i) for i in self.db_list.curselection()]
+        if not selected:
+            return
+        exists = {db.lower() for db in self.full_sync_dbs}
+        changed = False
+        for db in selected:
+            key = db.lower()
+            if key in exists:
+                continue
+            self.full_sync_dbs.append(db)
+            exists.add(key)
+            changed = True
+        if changed:
+            self._refresh_full_sync_list_widget()
+
+    def _remove_from_full_sync(self) -> None:
+        selected = [self.full_sync_list.get(i) for i in self.full_sync_list.curselection()]
+        if not selected:
+            return
+        remove_keys = {db.lower() for db in selected}
+        self.full_sync_dbs = [db for db in self.full_sync_dbs if db.lower() not in remove_keys]
+        self._refresh_full_sync_list_widget()
+
+    def _clear_full_sync_pool(self) -> None:
+        self.full_sync_dbs = []
+        self._refresh_full_sync_list_widget()
 
     def _on_table_filter_change(self, _event=None) -> None:
         self._refresh_table_list_widget()
@@ -2037,6 +2462,217 @@ class PgloaderGUI(tk.Tk):
             messagebox.showerror("错误", f"保存模板失败: {exc}")
             return
         messagebox.showinfo("已保存", "模板已保存。")
+
+    def _load_sync_history_records(self) -> None:
+        self.sync_history_records = []
+        if not os.path.isfile(self.sync_history_path):
+            self._refresh_history_tree()
+            return
+        try:
+            with open(self.sync_history_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                self.sync_history_records = [item for item in data if isinstance(item, dict)]
+        except Exception:
+            self.sync_history_records = []
+        self._refresh_history_tree()
+
+    def _load_uri_history_records(self) -> None:
+        self.uri_history_records = []
+        if not os.path.isfile(self.uri_history_path):
+            return
+        try:
+            with open(self.uri_history_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                self.uri_history_records = [str(item).strip() for item in data if str(item).strip()]
+        except Exception:
+            self.uri_history_records = []
+
+    def _save_uri_history_records(self) -> None:
+        try:
+            with open(self.uri_history_path, "w", encoding="utf-8") as f:
+                json.dump(self.uri_history_records, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _remember_uri(self, uri: str) -> None:
+        value = str(uri or "").strip()
+        if not value:
+            return
+        existed = [item for item in self.uri_history_records if item != value]
+        self.uri_history_records = [value] + existed
+        if len(self.uri_history_records) > 200:
+            self.uri_history_records = self.uri_history_records[:200]
+        self._save_uri_history_records()
+
+    def _open_uri_history_dialog(self, target_var: tk.StringVar) -> None:
+        history = [item for item in self.uri_history_records if item.strip()]
+        if not history:
+            messagebox.showinfo("提示", "暂无数据库链接历史。")
+            return
+
+        dlg = tk.Toplevel(self)
+        dlg.title("选择数据库链接历史")
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.geometry("980x420")
+        dlg.minsize(760, 320)
+
+        frame = ttk.Frame(dlg, padding=10)
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text="双击或选中后点击“使用所选链接”即可回填。", justify=tk.LEFT).pack(anchor="w", pady=(0, 8))
+
+        list_frame = ttk.Frame(frame)
+        list_frame.pack(fill=tk.BOTH, expand=True)
+        listbox = tk.Listbox(list_frame, selectmode=tk.SINGLE)
+        listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar = ttk.Scrollbar(list_frame, command=listbox.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        listbox.configure(yscrollcommand=scrollbar.set)
+
+        for item in history:
+            listbox.insert(tk.END, item)
+
+        if history:
+            listbox.selection_set(0)
+
+        result = {"chosen": ""}
+
+        def refresh_listbox(select_index: int = 0) -> None:
+            listbox.delete(0, tk.END)
+            for item in history:
+                listbox.insert(tk.END, item)
+            if history:
+                select_index = max(0, min(select_index, len(history) - 1))
+                listbox.selection_set(select_index)
+
+        def choose_selected() -> None:
+            selected = listbox.curselection()
+            if not selected:
+                return
+            value = listbox.get(selected[0])
+            result["chosen"] = value
+            dlg.destroy()
+
+        def delete_selected() -> None:
+            selected = listbox.curselection()
+            if not selected:
+                messagebox.showinfo("提示", "请先选择一条历史链接。")
+                return
+            idx = selected[0]
+            value = listbox.get(idx)
+            ok = messagebox.askyesno("确认", "确定删除所选历史链接吗？")
+            if not ok:
+                return
+            try:
+                history.remove(value)
+            except ValueError:
+                return
+            self.uri_history_records = [item for item in self.uri_history_records if item != value]
+            self._save_uri_history_records()
+            if not history:
+                messagebox.showinfo("提示", "历史链接已全部删除。")
+                dlg.destroy()
+                return
+            refresh_listbox(select_index=idx)
+
+        def on_double_click(_event=None) -> None:
+            choose_selected()
+
+        listbox.bind("<Double-Button-1>", on_double_click)
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(btns, text="取消", command=dlg.destroy).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="删除所选", command=delete_selected).pack(side=tk.RIGHT, padx=6)
+        ttk.Button(btns, text="使用所选链接", command=choose_selected).pack(side=tk.RIGHT, padx=6)
+
+        dlg.wait_window()
+        if result["chosen"]:
+            target_var.set(result["chosen"])
+            self._remember_uri(result["chosen"])
+
+    def _save_sync_history_records(self) -> None:
+        try:
+            with open(self.sync_history_path, "w", encoding="utf-8") as f:
+                json.dump(self.sync_history_records, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _format_duration_text(self, duration_seconds: float) -> str:
+        if duration_seconds < 60:
+            return f"{duration_seconds:.1f}s"
+        mins, secs = divmod(int(duration_seconds), 60)
+        hours, mins = divmod(mins, 60)
+        if hours > 0:
+            return f"{hours}h {mins}m {secs}s"
+        return f"{mins}m {secs}s"
+
+    def _append_sync_history_record(self, record: dict) -> None:
+        if not isinstance(record, dict):
+            return
+        source_db = str(record.get("source_db", "") or "")
+        target_db = str(record.get("target_db", "") or "")
+        sync_time = str(record.get("sync_time", "") or "")
+        result = str(record.get("result", "") or "")
+        duration_seconds_raw = record.get("duration_seconds", 0)
+        try:
+            duration_seconds = float(duration_seconds_raw)
+        except (TypeError, ValueError):
+            duration_seconds = 0.0
+
+        new_item = {
+            "source_db": source_db,
+            "target_db": target_db,
+            "sync_time": sync_time,
+            "result": result,
+            "duration_seconds": duration_seconds,
+        }
+        self.sync_history_records.insert(0, new_item)
+        if len(self.sync_history_records) > 1000:
+            self.sync_history_records = self.sync_history_records[:1000]
+        self._save_sync_history_records()
+        self._refresh_history_tree()
+
+    def _refresh_history_tree(self) -> None:
+        if not hasattr(self, "history_tree"):
+            return
+        for item_id in self.history_tree.get_children():
+            self.history_tree.delete(item_id)
+
+        for item in self.sync_history_records:
+            duration_text = self._format_duration_text(float(item.get("duration_seconds", 0) or 0))
+            self.history_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    str(item.get("source_db", "") or ""),
+                    str(item.get("target_db", "") or ""),
+                    str(item.get("sync_time", "") or ""),
+                    str(item.get("result", "") or ""),
+                    duration_text,
+                ),
+            )
+
+    def _clear_sync_history(self) -> None:
+        if not self.sync_history_records and not os.path.isfile(self.sync_history_path):
+            messagebox.showinfo("提示", "暂无历史记录可清空。")
+            return
+
+        ok = messagebox.askyesno("确认", "确定要清空当前机器的同步历史记录吗？")
+        if not ok:
+            return
+
+        self.sync_history_records = []
+        try:
+            if os.path.isfile(self.sync_history_path):
+                os.remove(self.sync_history_path)
+        except OSError:
+            pass
+
+        self._refresh_history_tree()
+        self.queue.put(("log", "已清空同步历史记录。\n"))
 
     def _format_size(self, num_bytes: int) -> str:
         if num_bytes < 1024:
