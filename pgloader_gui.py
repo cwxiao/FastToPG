@@ -6,11 +6,11 @@ import subprocess
 import threading
 import time
 import tkinter as tk
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 import glob
 from collections import deque
 from tkinter import ttk, messagebox, filedialog
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 DEFAULT_CONFIG = "pgloader_tool.json"
 SYNC_HISTORY_FILE = "sync_history.json"
@@ -120,7 +120,71 @@ def run_command(cmd: list, env: dict | None = None) -> subprocess.CompletedProce
     )
 
 
-def get_total_tables(mysql_container: str, user: str, password: str, db: str) -> int:
+def normalize_db_uri(uri: str) -> str:
+    text = (uri or "").strip()
+    if not text:
+        return ""
+    return re.sub(r"^([a-zA-Z][a-zA-Z0-9+.-]*):/(?!/)", r"\1://", text)
+
+
+def mask_uri_password(uri: str) -> str:
+    text = normalize_db_uri(uri)
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if not parsed.scheme:
+        return text
+    user = parsed.username or ""
+    password = parsed.password
+    host = parsed.hostname or ""
+    port = parsed.port
+    db = (parsed.path or "").lstrip("/")
+    auth = user
+    if password is not None:
+        auth = f"{user}:***" if user else "***"
+    netloc = auth + ("@" if auth else "") + host + (f":{port}" if port else "")
+    return f"{parsed.scheme}://{netloc}/{db}"
+
+
+def build_mysql_uri_from_conn(conn: dict[str, str | int], db: str) -> str:
+    user = quote(str(conn.get("user", "")), safe="")
+    password = quote(str(conn.get("password", "")), safe="")
+    host = (str(conn.get("host", "")) or "127.0.0.1").strip()
+    port_raw = conn.get("port", 3306)
+    port = int(port_raw or 3306)
+    auth = user if not password else f"{user}:{password}"
+    return f"mysql://{auth}@{host}:{port}/{db}"
+
+
+def resolve_mysql_conn(config: dict, db: str) -> dict[str, str | int]:
+    mysql_cfg = config.get("mysql", {})
+    source_uri = normalize_db_uri((config.get("source", {}).get("uri") or "").replace("{{DB_NAME}}", db))
+
+    host = ""
+    port = 0
+    user = str(mysql_cfg.get("user", ""))
+    password = str(mysql_cfg.get("password", ""))
+
+    try:
+        source = parse_db_uri(source_uri)
+        if str(source.get("scheme", "")).lower() == "mysql":
+            host = str(source.get("host", "") or "")
+            port = int(source.get("port", 0) or 0)
+            user = str(source.get("user", "") or user)
+            password = str(source.get("password", "") or password)
+    except Exception:
+        pass
+
+    return {
+        "container": str(mysql_cfg.get("container", "")),
+        "host": host,
+        "port": port,
+        "user": user,
+        "password": password,
+    }
+
+
+def get_total_tables(mysql_container: str, user: str, password: str, db: str, host: str = "", port: int = 0) -> int:
     cmd = [
         "docker",
         "exec",
@@ -129,9 +193,15 @@ def get_total_tables(mysql_container: str, user: str, password: str, db: str) ->
         f"-u{user}",
         f"-p{password}",
         "-N",
+    ]
+    if host:
+        cmd.extend(["-h", host])
+    if port:
+        cmd.extend(["-P", str(port)])
+    cmd.extend([
         "-e",
         f"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='{db}';",
-    ]
+    ])
     result = run_command(cmd)
     if result.returncode != 0:
         return 0
@@ -312,7 +382,35 @@ def clear_target_public_tables(db: str, config: dict, selected_tables: list[str]
     return code, prefix + out
 
 
-def get_mysql_tables(mysql_container: str, user: str, password: str, db: str) -> list[str]:
+def build_clear_public_views_sql() -> str:
+    return (
+        "DO $$ "
+        "DECLARE r record; "
+        "BEGIN "
+        "FOR r IN SELECT viewname FROM pg_views WHERE schemaname='public' LOOP "
+        "EXECUTE format('DROP VIEW IF EXISTS public.%I CASCADE', r.viewname); "
+        "END LOOP; "
+        "END $$;"
+    )
+
+
+def clear_target_public_views(db: str, config: dict) -> tuple[int, str]:
+    target_cfg = config.get("target", {})
+    target_uri = target_cfg.get("uri", "").replace("{{DB_NAME}}", db)
+    target = parse_db_uri(target_uri)
+
+    if target.get("scheme") not in ("postgresql", "pgsql", "postgres"):
+        return 1, f"Skip clear public views: unsupported target scheme {target.get('scheme')}\n"
+
+    sql = build_clear_public_views_sql()
+    prefix = f"清理目标库 public 视图: {target.get('database', '')}\n"
+    code, out = run_psql_container_sql(target, target_cfg, sql)
+    if code == 0:
+        return 0, prefix + out
+    return code, prefix + out
+
+
+def get_mysql_tables(mysql_container: str, user: str, password: str, db: str, host: str = "", port: int = 0) -> list[str]:
     cmd = [
         "docker",
         "exec",
@@ -321,19 +419,25 @@ def get_mysql_tables(mysql_container: str, user: str, password: str, db: str) ->
         f"-u{user}",
         f"-p{password}",
         "-N",
+    ]
+    if host:
+        cmd.extend(["-h", host])
+    if port:
+        cmd.extend(["-P", str(port)])
+    cmd.extend([
         "-e",
         (
             "SELECT table_name FROM information_schema.tables "
             f"WHERE table_schema='{db}' AND table_type='BASE TABLE' ORDER BY table_name;"
         ),
-    ]
+    ])
     result = run_command(cmd)
     if result.returncode != 0:
         return []
     return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 
 
-def get_mysql_columns(mysql_container: str, user: str, password: str, db: str, table: str) -> list[str]:
+def get_mysql_views(mysql_container: str, user: str, password: str, db: str, host: str = "", port: int = 0) -> list[str]:
     cmd = [
         "docker",
         "exec",
@@ -342,19 +446,230 @@ def get_mysql_columns(mysql_container: str, user: str, password: str, db: str, t
         f"-u{user}",
         f"-p{password}",
         "-N",
+    ]
+    if host:
+        cmd.extend(["-h", host])
+    if port:
+        cmd.extend(["-P", str(port)])
+    cmd.extend([
+        "-e",
+        (
+            "SELECT table_name FROM information_schema.views "
+            f"WHERE table_schema='{db}' ORDER BY table_name;"
+        ),
+    ])
+    result = run_command(cmd)
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def get_mysql_view_definition(
+    mysql_container: str,
+    user: str,
+    password: str,
+    db: str,
+    view_name: str,
+    host: str = "",
+    port: int = 0,
+) -> str:
+    cmd = [
+        "docker",
+        "exec",
+        mysql_container,
+        "mysql",
+        f"-u{user}",
+        f"-p{password}",
+        "-N",
+    ]
+    if host:
+        cmd.extend(["-h", host])
+    if port:
+        cmd.extend(["-P", str(port)])
+    cmd.extend([
+        "-e",
+        (
+            "SELECT view_definition FROM information_schema.views "
+            f"WHERE table_schema='{db}' AND table_name='{view_name}';"
+        ),
+    ])
+    result = run_command(cmd)
+    if result.returncode != 0:
+        return ""
+    lines = [line.rstrip("\r") for line in (result.stdout or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    return "\n".join(lines)
+
+
+def transform_mysql_view_definition(view_sql: str, source_db: str) -> str:
+    transformed = (view_sql or "").strip().rstrip(";")
+    if not transformed:
+        return ""
+
+    transformed = re.sub(rf"`{re.escape(source_db)}`\.", "", transformed, flags=re.IGNORECASE)
+    transformed = re.sub(rf"\b{re.escape(source_db)}\.", "", transformed, flags=re.IGNORECASE)
+
+    def _replace_bt_ident(match: re.Match[str]) -> str:
+        return pg_quote_ident(match.group(1).lower())
+
+    def _replace_year_func(match: re.Match[str]) -> str:
+        expr = match.group(1).strip()
+        return f"EXTRACT(YEAR FROM {expr})"
+
+    def _replace_month_func(match: re.Match[str]) -> str:
+        expr = match.group(1).strip()
+        return f"EXTRACT(MONTH FROM {expr})"
+
+    def _replace_quarter_func(match: re.Match[str]) -> str:
+        expr = match.group(1).strip()
+        return f"EXTRACT(QUARTER FROM {expr})"
+
+    transformed = re.sub(r"`([^`]+)`", _replace_bt_ident, transformed)
+    transformed = re.sub(r"\bIFNULL\(", "COALESCE(", transformed, flags=re.IGNORECASE)
+    transformed = re.sub(r"\bYEAR\s*\(\s*([^\(\)]+?)\s*\)", _replace_year_func, transformed, flags=re.IGNORECASE)
+    transformed = re.sub(r"\bMONTH\s*\(\s*([^\(\)]+?)\s*\)", _replace_month_func, transformed, flags=re.IGNORECASE)
+    transformed = re.sub(r"\bQUARTER\s*\(\s*([^\(\)]+?)\s*\)", _replace_quarter_func, transformed, flags=re.IGNORECASE)
+    return transformed
+
+
+def sync_views_for_db(db: str, config: dict) -> tuple[int, str]:
+    mysql_conn = resolve_mysql_conn(config, db)
+    views = get_mysql_views(
+        str(mysql_conn.get("container", "")),
+        str(mysql_conn.get("user", "")),
+        str(mysql_conn.get("password", "")),
+        db,
+        host=str(mysql_conn.get("host", "")),
+        port=int(mysql_conn.get("port", 0) or 0),
+    )
+    if not views:
+        return 0, f"View sync skipped: no views found in {db}\n"
+
+    output_lines: list[str] = [f"View sync start: {db}, views={len(views)}\n"]
+    output_lines.append(f"Source view list ({db}): {', '.join(views)}\n")
+    target_cfg = config.get("target", {})
+    target_uri = target_cfg.get("uri", "").replace("{{DB_NAME}}", db)
+    target = parse_db_uri(target_uri)
+
+    if target.get("scheme") not in ("postgresql", "pgsql", "postgres"):
+        return 1, f"Skip view sync: unsupported target scheme {target.get('scheme')}\n"
+
+    view_sql_map: dict[str, str] = {}
+    for view_name in views:
+        raw_definition = get_mysql_view_definition(
+            str(mysql_conn.get("container", "")),
+            str(mysql_conn.get("user", "")),
+            str(mysql_conn.get("password", "")),
+            db,
+            view_name,
+            host=str(mysql_conn.get("host", "")),
+            port=int(mysql_conn.get("port", 0) or 0),
+        )
+        if not raw_definition:
+            output_lines.append(f"View sync skipped: {db}.{view_name} (empty definition)\n")
+            continue
+
+        definition = transform_mysql_view_definition(raw_definition, db)
+        if not definition:
+            output_lines.append(f"View sync skipped: {db}.{view_name} (unsupported definition)\n")
+            continue
+
+        view_sql_map[view_name] = definition
+
+    if not view_sql_map:
+        output_lines.append(f"View sync skipped: no valid view definitions in {db}\n")
+        return 0, "".join(output_lines)
+
+    pending = list(view_sql_map.keys())
+    total_valid = len(pending)
+    synced_count = 0
+    round_no = 0
+
+    while pending:
+        round_no += 1
+        round_progress = 0
+        next_pending: list[str] = []
+        failed_output_by_view: dict[str, str] = {}
+        output_lines.append(f"View sync round {round_no}: pending={len(pending)}\n")
+
+        for view_name in pending:
+            definition = view_sql_map[view_name]
+
+            view_ident = pg_quote_ident(view_name.lower())
+            sql = f"CREATE OR REPLACE VIEW public.{view_ident} AS {definition};"
+            code, out = run_psql_container_sql(target, target_cfg, sql)
+            if code != 0:
+                next_pending.append(view_name)
+                failed_output_by_view[view_name] = out
+                continue
+
+            synced_count += 1
+            round_progress += 1
+            output_lines.append(f"View synced: {db}.{view_name} [{synced_count}/{total_valid}]\n")
+
+        if not next_pending:
+            output_lines.append(f"View sync success: {db}\n")
+            return 0, "".join(output_lines)
+
+        if round_progress == 0:
+            first_failed = next_pending[0]
+            unresolved = ", ".join(next_pending)
+            output_lines.append(f"View sync failed: unresolved dependent or incompatible views in {db}: {unresolved}\n")
+            detail = failed_output_by_view.get(first_failed, "")
+            if detail:
+                output_lines.append(detail)
+            return 1, "".join(output_lines)
+
+        pending = next_pending
+
+    output_lines.append(f"View sync success: {db}\n")
+    return 0, "".join(output_lines)
+
+
+def get_mysql_columns(
+    mysql_container: str,
+    user: str,
+    password: str,
+    db: str,
+    table: str,
+    host: str = "",
+    port: int = 0,
+) -> list[str]:
+    cmd = [
+        "docker",
+        "exec",
+        mysql_container,
+        "mysql",
+        f"-u{user}",
+        f"-p{password}",
+        "-N",
+    ]
+    if host:
+        cmd.extend(["-h", host])
+    if port:
+        cmd.extend(["-P", str(port)])
+    cmd.extend([
         "-e",
         (
             "SELECT column_name FROM information_schema.columns "
             f"WHERE table_schema='{db}' AND table_name='{table}' ORDER BY ordinal_position;"
         ),
-    ]
+    ])
     result = run_command(cmd)
     if result.returncode != 0:
         return []
     return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 
 
-def get_mysql_primary_key_map(mysql_container: str, user: str, password: str, db: str) -> dict[str, list[str]]:
+def get_mysql_primary_key_map(
+    mysql_container: str,
+    user: str,
+    password: str,
+    db: str,
+    host: str = "",
+    port: int = 0,
+) -> dict[str, list[str]]:
     cmd = [
         "docker",
         "exec",
@@ -363,6 +678,12 @@ def get_mysql_primary_key_map(mysql_container: str, user: str, password: str, db
         f"-u{user}",
         f"-p{password}",
         "-N",
+    ]
+    if host:
+        cmd.extend(["-h", host])
+    if port:
+        cmd.extend(["-P", str(port)])
+    cmd.extend([
         "-e",
         (
             "SELECT tc.table_name, k.column_name "
@@ -374,7 +695,7 @@ def get_mysql_primary_key_map(mysql_container: str, user: str, password: str, db
             f"WHERE tc.constraint_type='PRIMARY KEY' AND tc.table_schema='{db}' "
             "ORDER BY tc.table_name, k.ordinal_position;"
         ),
-    ]
+    ])
     result = run_command(cmd)
     if result.returncode != 0:
         return {}
@@ -431,12 +752,14 @@ def build_add_primary_keys_sql(pk_map: dict[str, list[str]]) -> str:
 
 
 def ensure_target_primary_keys(db: str, config: dict, selected_tables: list[str] | None = None) -> tuple[int, str]:
-    mysql_cfg = config.get("mysql", {})
+    mysql_conn = resolve_mysql_conn(config, db)
     pk_map = get_mysql_primary_key_map(
-        mysql_cfg.get("container", ""),
-        mysql_cfg.get("user", ""),
-        mysql_cfg.get("password", ""),
+        str(mysql_conn.get("container", "")),
+        str(mysql_conn.get("user", "")),
+        str(mysql_conn.get("password", "")),
         db,
+        host=str(mysql_conn.get("host", "")),
+        port=int(mysql_conn.get("port", 0) or 0),
     )
     selected = parse_selected_tables(selected_tables)
     if selected:
@@ -510,7 +833,15 @@ def clear_target_public_table_data(db: str, config: dict, selected_tables: list[
     return code, prefix + out
 
 
-def get_mysql_split_pk(mysql_container: str, user: str, password: str, db: str, table: str) -> str | None:
+def get_mysql_split_pk(
+    mysql_container: str,
+    user: str,
+    password: str,
+    db: str,
+    table: str,
+    host: str = "",
+    port: int = 0,
+) -> str | None:
     cmd = [
         "docker",
         "exec",
@@ -519,6 +850,12 @@ def get_mysql_split_pk(mysql_container: str, user: str, password: str, db: str, 
         f"-u{user}",
         f"-p{password}",
         "-N",
+    ]
+    if host:
+        cmd.extend(["-h", host])
+    if port:
+        cmd.extend(["-P", str(port)])
+    cmd.extend([
         "-e",
         (
             "SELECT k.column_name, c.data_type FROM information_schema.table_constraints tc "
@@ -533,7 +870,7 @@ def get_mysql_split_pk(mysql_container: str, user: str, password: str, db: str, 
             f"WHERE tc.constraint_type='PRIMARY KEY' AND tc.table_schema='{db}' AND tc.table_name='{table}' "
             "ORDER BY k.ordinal_position;"
         ),
-    ]
+    ])
     result = run_command(cmd)
     if result.returncode != 0:
         return None
@@ -560,7 +897,7 @@ def get_mysql_split_pk(mysql_container: str, user: str, password: str, db: str, 
     return col_name
 
 
-def get_mysql_databases(mysql_container: str, user: str, password: str) -> list[str]:
+def get_mysql_databases(mysql_container: str, user: str, password: str, host: str = "", port: int = 0) -> list[str]:
     cmd = [
         "docker",
         "exec",
@@ -569,13 +906,19 @@ def get_mysql_databases(mysql_container: str, user: str, password: str) -> list[
         f"-u{user}",
         f"-p{password}",
         "-N",
+    ]
+    if host:
+        cmd.extend(["-h", host])
+    if port:
+        cmd.extend(["-P", str(port)])
+    cmd.extend([
         "-e",
         (
             "SELECT schema_name FROM information_schema.schemata "
             "WHERE schema_name NOT IN ('information_schema','mysql','performance_schema','sys') "
             "ORDER BY schema_name;"
         ),
-    ]
+    ])
     result = run_command(cmd)
     if result.returncode != 0:
         return []
@@ -1005,6 +1348,8 @@ class PgloaderGUI(tk.Tk):
         self.run_structure_button.pack(side=tk.LEFT)
         self.run_data_button = ttk.Button(bottom, text="同步数据", command=lambda: self._run_selected("data"))
         self.run_data_button.pack(side=tk.LEFT, padx=5)
+        self.run_view_button = ttk.Button(bottom, text="同步视图", command=lambda: self._run_selected("view"))
+        self.run_view_button.pack(side=tk.LEFT, padx=5)
         self.run_full_button = ttk.Button(bottom, text="全同步", command=lambda: self._run_selected("full"))
         self.run_full_button.pack(side=tk.LEFT, padx=5)
         self.stop_button = ttk.Button(bottom, text="停止", command=self._stop_run, state=tk.DISABLED)
@@ -1271,10 +1616,10 @@ class PgloaderGUI(tk.Tk):
             "load_template": self.load_template.get().strip(),
             "source": {
                 "type": self.source_type.get().strip(),
-                "uri": self.source_uri.get().strip(),
+                "uri": normalize_db_uri(self.source_uri.get().strip()),
             },
             "target": {
-                "uri": self.target_uri.get().strip(),
+                "uri": normalize_db_uri(self.target_uri.get().strip()),
                 "psql_container": self.target_psql_container.get().strip() or "postgres16",
             },
             "mysql": {
@@ -1294,7 +1639,7 @@ class PgloaderGUI(tk.Tk):
                 "python": self.datax_python.get().strip() or "python",
                 "jvm": "-Xms2g -Xmx6g -XX:+UseG1GC -XX:+HeapDumpOnOutOfMemoryError",
                 "loglevel": "warn",
-                "source_uri": self.datax_source_uri.get().strip(),
+                "source_uri": normalize_db_uri(self.datax_source_uri.get().strip()),
                 "mysql_jdbc_params": "useSSL=false",
                 "target_table_lowercase": True,
                 "target_column_lowercase": True,
@@ -1340,6 +1685,8 @@ class PgloaderGUI(tk.Tk):
 
         if mode in ("structure", "full") and not self._confirm_structure_sync():
             return
+        if mode == "view" and not self._confirm_view_sync():
+            return
 
         if mode == "full":
             dbs = list(self.full_sync_list.get(0, tk.END))
@@ -1357,6 +1704,8 @@ class PgloaderGUI(tk.Tk):
             if selected_tables and len(dbs) != 1:
                 messagebox.showerror("错误", "选择单表/多表迁移时，只能选择一个数据库。")
                 return
+            if mode == "view":
+                selected_tables = []
 
         try:
             env = json.loads(self.env_text.get("1.0", tk.END).strip() or "{}")
@@ -1402,6 +1751,8 @@ class PgloaderGUI(tk.Tk):
                 "env": env,
                 "clear_public_before_sync": True,
                 "show_output": True,
+                "sync_views": True,
+                "clear_public_views_before_view_sync": bool(mode == "view"),
                 "clear_table_data_before_data_sync": bool(mode == "full"),
             },
             "datax": {
@@ -1434,10 +1785,11 @@ class PgloaderGUI(tk.Tk):
 
         self.run_structure_button.configure(state=tk.DISABLED)
         self.run_data_button.configure(state=tk.DISABLED)
+        self.run_view_button.configure(state=tk.DISABLED)
         self.run_full_button.configure(state=tk.DISABLED)
         self.stop_button.configure(state=tk.NORMAL)
         self.progress.configure(value=0)
-        title = "结构同步" if mode == "structure" else ("数据同步" if mode == "data" else "全同步")
+        title = "结构同步" if mode == "structure" else ("数据同步" if mode == "data" else ("视图同步" if mode == "view" else "全同步"))
         self.progress_label.configure(text=f"{title} 启动中...")
         self.eta_label.configure(text="预计剩余: --")
         self.size_label.configure(text="已选数据库大小: --")
@@ -1446,7 +1798,7 @@ class PgloaderGUI(tk.Tk):
         self.overall_total_tables = 0
         self.overall_processed_tables = 0
         self.current_mode = mode
-        self.eta_task_total = len(dbs) * (3 if mode == "full" else 1)
+        self.eta_task_total = len(dbs) * (4 if mode == "full" else 1)
         self.eta_task_done = 0
         self.start_time = time.time()
         self.last_progress_time = self.start_time
@@ -1490,17 +1842,26 @@ class PgloaderGUI(tk.Tk):
                 for db in config["databases"]:
                     if config.get("source", {}).get("type", "mysql") != "mysql":
                         continue
-                    mysql_cfg = config["mysql"]
+                    mysql_conn = resolve_mysql_conn(config, db)
                     if selected_tables:
-                        all_tables = get_mysql_tables(mysql_cfg["container"], mysql_cfg["user"], mysql_cfg["password"], db)
+                        all_tables = get_mysql_tables(
+                            str(mysql_conn.get("container", "")),
+                            str(mysql_conn.get("user", "")),
+                            str(mysql_conn.get("password", "")),
+                            db,
+                            host=str(mysql_conn.get("host", "")),
+                            port=int(mysql_conn.get("port", 0) or 0),
+                        )
                         selected_found, _ = filter_tables_by_selected(all_tables, selected_tables)
                         self.overall_total_tables += len(selected_found)
                     else:
                         self.overall_total_tables += get_total_tables(
-                            mysql_cfg["container"],
-                            mysql_cfg["user"],
-                            mysql_cfg["password"],
+                            str(mysql_conn.get("container", "")),
+                            str(mysql_conn.get("user", "")),
+                            str(mysql_conn.get("password", "")),
                             db,
+                            host=str(mysql_conn.get("host", "")),
+                            port=int(mysql_conn.get("port", 0) or 0),
                         )
 
             if mode == "full":
@@ -1508,9 +1869,12 @@ class PgloaderGUI(tk.Tk):
                 for db in config["databases"]:
                     execution_items.append((db, "structure"))
                     execution_items.append((db, "primary_key"))
+                    execution_items.append((db, "view"))
                     execution_items.append((db, "data"))
             elif mode == "structure":
                 execution_items = [(db, "structure") for db in config["databases"]]
+            elif mode == "view":
+                execution_items = [(db, "view") for db in config["databases"]]
             else:
                 execution_items = [(db, "data") for db in config["databases"]]
 
@@ -1525,6 +1889,8 @@ class PgloaderGUI(tk.Tk):
                         phase_name = "结构同步"
                     elif phase == "primary_key":
                         phase_name = "主键同步"
+                    elif phase == "view":
+                        phase_name = "视图同步"
                     else:
                         phase_name = "数据同步"
                     self.queue.put(("log", f"\n>>>> 全同步阶段：{db} - {phase_name} <<<<\n"))
@@ -1557,6 +1923,8 @@ class PgloaderGUI(tk.Tk):
                     title = "结构同步"
                 elif phase == "primary_key":
                     title = "主键同步"
+                elif phase == "view":
+                    title = "视图同步"
                 else:
                     title = "数据同步"
                 self.queue.put(("log", f"===============================\n开始{title}数据库: {db}\n===============================\n"))
@@ -1575,17 +1943,19 @@ class PgloaderGUI(tk.Tk):
                             self.queue.put(("failed", f"清理目标库 public 表失败: {db}\n"))
                             return
 
-                    mysql_cfg = config["mysql"]
+                    mysql_conn = resolve_mysql_conn(config, db)
                     source_type = config.get("source", {}).get("type", "mysql")
                     total_tables = 0
                     table_filter_clause = ""
                     if source_type == "mysql":
                         if selected_tables:
                             all_tables = get_mysql_tables(
-                                mysql_cfg["container"],
-                                mysql_cfg["user"],
-                                mysql_cfg["password"],
+                                str(mysql_conn.get("container", "")),
+                                str(mysql_conn.get("user", "")),
+                                str(mysql_conn.get("password", "")),
                                 db,
+                                host=str(mysql_conn.get("host", "")),
+                                port=int(mysql_conn.get("port", 0) or 0),
                             )
                             selected_found, missing_tables = filter_tables_by_selected(all_tables, selected_tables)
                             if missing_tables:
@@ -1598,14 +1968,21 @@ class PgloaderGUI(tk.Tk):
                             table_filter_clause = build_pgloader_table_filter_clause(selected_found)
                         else:
                             total_tables = get_total_tables(
-                                mysql_cfg["container"],
-                                mysql_cfg["user"],
-                                mysql_cfg["password"],
+                                str(mysql_conn.get("container", "")),
+                                str(mysql_conn.get("user", "")),
+                                str(mysql_conn.get("password", "")),
                                 db,
+                                host=str(mysql_conn.get("host", "")),
+                                port=int(mysql_conn.get("port", 0) or 0),
                             )
 
-                    source_uri = config.get("source", {}).get("uri", "").replace("{{DB_NAME}}", db)
-                    target_uri = config.get("target", {}).get("uri", "").replace("{{DB_NAME}}", db)
+                    source_uri = normalize_db_uri(config.get("source", {}).get("uri", "").replace("{{DB_NAME}}", db))
+                    if source_type == "mysql":
+                        source_uri = build_mysql_uri_from_conn(mysql_conn, db)
+                    target_uri = normalize_db_uri(config.get("target", {}).get("uri", "").replace("{{DB_NAME}}", db))
+
+                    self.queue.put(("log", f"结构同步源URI: {mask_uri_password(source_uri)}\n"))
+                    self.queue.put(("log", f"结构同步目标URI: {mask_uri_password(target_uri)}\n"))
 
                     template_path = os.path.join(self.workspace, config["load_template"])
                     rendered_name = f".pgloader_rendered_{db}.load"
@@ -1625,7 +2002,7 @@ class PgloaderGUI(tk.Tk):
                     )
                     if mode == "full":
                         patch_rendered_load_for_full_sync(rendered_path)
-                        self.queue.put(("log", "全同步结构阶段：已禁用外键创建，按 结构->主键->数据 顺序执行。\n"))
+                        self.queue.put(("log", "全同步结构阶段：已禁用外键创建，按 结构->主键->视图->数据 顺序执行。\n"))
 
                     cmd = build_pgloader_command(
                         workspace=self.workspace,
@@ -1694,6 +2071,16 @@ class PgloaderGUI(tk.Tk):
                             self.queue.put(("failed", f"补主键失败: {db}\n"))
                             return
 
+                    sync_views_enabled = bool(config.get("pgloader", {}).get("sync_views", True))
+                    if sync_views_enabled and mode != "full":
+                        view_code, view_output = sync_views_for_db(db, config)
+                        if view_output:
+                            self.queue.put(("log", view_output + ("" if view_output.endswith("\n") else "\n")))
+                        if view_code != 0:
+                            push_db_history("失败")
+                            self.queue.put(("failed", f"同步视图失败: {db}\n"))
+                            return
+
                     push_db_history("成功")
                     self.queue.put(("log", f"结构同步成功: {db}\n"))
                     self.queue.put(("phase_done",))
@@ -1709,6 +2096,28 @@ class PgloaderGUI(tk.Tk):
                             return
                     push_db_history("成功")
                     self.queue.put(("log", f"主键同步成功: {db}\n"))
+                    self.queue.put(("phase_done",))
+                elif phase == "view":
+                    if bool(config.get("pgloader", {}).get("clear_public_views_before_view_sync", False)):
+                        clear_view_code, clear_view_output = clear_target_public_views(db, config)
+                        if clear_view_output:
+                            self.queue.put(("log", clear_view_output + ("" if clear_view_output.endswith("\n") else "\n")))
+                        if clear_view_code != 0:
+                            push_db_history("失败")
+                            self.queue.put(("failed", f"清理目标库视图失败: {db}\n"))
+                            return
+
+                    sync_views_enabled = bool(config.get("pgloader", {}).get("sync_views", True))
+                    if sync_views_enabled:
+                        view_code, view_output = sync_views_for_db(db, config)
+                        if view_output:
+                            self.queue.put(("log", view_output + ("" if view_output.endswith("\n") else "\n")))
+                        if view_code != 0:
+                            push_db_history("失败")
+                            self.queue.put(("failed", f"同步视图失败: {db}\n"))
+                            return
+                    push_db_history("成功")
+                    self.queue.put(("log", f"视图同步成功: {db}\n"))
                     self.queue.put(("phase_done",))
                 else:
                     if bool(config.get("pgloader", {}).get("clear_table_data_before_data_sync", False)):
@@ -1740,16 +2149,18 @@ class PgloaderGUI(tk.Tk):
                     datax_cmd_cfg = dict(datax_cfg)
                     datax_cmd_cfg["home"] = datax_home
 
-                    mysql_cfg = config.get("mysql", {})
+                    mysql_conn = resolve_mysql_conn(config, db)
                     source_uri_template = datax_cfg.get("source_uri") or config.get("source", {}).get("uri", "")
-                    source_uri = source_uri_template.replace("{{DB_NAME}}", db)
-                    target_uri = config.get("target", {}).get("uri", "").replace("{{DB_NAME}}", db)
+                    source_uri = normalize_db_uri(source_uri_template.replace("{{DB_NAME}}", db))
+                    target_uri = normalize_db_uri(config.get("target", {}).get("uri", "").replace("{{DB_NAME}}", db))
 
                     tables = get_mysql_tables(
-                        mysql_cfg.get("container", ""),
-                        mysql_cfg.get("user", ""),
-                        mysql_cfg.get("password", ""),
+                        str(mysql_conn.get("container", "")),
+                        str(mysql_conn.get("user", "")),
+                        str(mysql_conn.get("password", "")),
                         db,
+                        host=str(mysql_conn.get("host", "")),
+                        port=int(mysql_conn.get("port", 0) or 0),
                     )
                     if selected_tables:
                         tables, missing_tables = filter_tables_by_selected(tables, selected_tables)
@@ -1779,22 +2190,26 @@ class PgloaderGUI(tk.Tk):
                             if self.stop_event.is_set():
                                 return 130, table, "", ""
                             columns = get_mysql_columns(
-                                mysql_cfg.get("container", ""),
-                                mysql_cfg.get("user", ""),
-                                mysql_cfg.get("password", ""),
+                                str(mysql_conn.get("container", "")),
+                                str(mysql_conn.get("user", "")),
+                                str(mysql_conn.get("password", "")),
                                 db,
                                 table,
+                                host=str(mysql_conn.get("host", "")),
+                                port=int(mysql_conn.get("port", 0) or 0),
                             )
                             if not columns:
                                 self.queue.put(("log", f"DataX skipped table: {db}.{table} (no columns)\n"))
                                 return 0, table, "", ""
 
                             split_pk = get_mysql_split_pk(
-                                mysql_cfg.get("container", ""),
-                                mysql_cfg.get("user", ""),
-                                mysql_cfg.get("password", ""),
+                                str(mysql_conn.get("container", "")),
+                                str(mysql_conn.get("user", "")),
+                                str(mysql_conn.get("password", "")),
                                 db,
                                 table,
+                                host=str(mysql_conn.get("host", "")),
+                                port=int(mysql_conn.get("port", 0) or 0),
                             )
                             channel = int(datax_cfg.get("channel", 2))
                             batch_size = int(datax_cfg.get("batch_size", 2000))
@@ -1860,8 +2275,14 @@ class PgloaderGUI(tk.Tk):
                                 for t_idx, table in enumerate(tables, start=1)
                             }
                             for future in as_completed(futures):
-                                dcode, failed_table, detail, _ = future.result()
+                                try:
+                                    dcode, failed_table, detail, _ = future.result()
+                                except CancelledError:
+                                    # Other table tasks are cancelled after first failure; ignore these.
+                                    continue
                                 if dcode == 130:
+                                    if first_error is not None:
+                                        continue
                                     for pending in futures:
                                         pending.cancel()
                                     push_db_history("已停止")
@@ -1998,6 +2419,7 @@ class PgloaderGUI(tk.Tk):
         self.size_label.configure(text="已选数据库大小: --")
         self.run_structure_button.configure(state=tk.NORMAL)
         self.run_data_button.configure(state=tk.NORMAL)
+        self.run_view_button.configure(state=tk.NORMAL)
         self.run_full_button.configure(state=tk.NORMAL)
         self.stop_button.configure(state=tk.DISABLED)
         self.current_process = None
@@ -2072,6 +2494,49 @@ class PgloaderGUI(tk.Tk):
         dlg.wait_window()
         return result["ok"]
 
+    def _confirm_view_sync(self) -> bool:
+        dlg = tk.Toplevel(self)
+        dlg.title("视图同步确认")
+        dlg.transient(self)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        frame = ttk.Frame(dlg, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        tip = "该操作会先清空目标数据库 public 下全部视图，然后再执行视图同步。\n请先完成备份，再继续。"
+        ttk.Label(frame, text=tip, justify=tk.LEFT).pack(anchor="w", pady=(0, 10))
+
+        result = {"ok": False}
+
+        def on_confirm() -> None:
+            result["ok"] = True
+            dlg.destroy()
+
+        def on_cancel() -> None:
+            dlg.destroy()
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill=tk.X)
+        ttk.Button(btns, text="取消", command=on_cancel).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="我已备份，开始同步", command=on_confirm).pack(side=tk.RIGHT, padx=6)
+
+        dlg.update_idletasks()
+        self.update_idletasks()
+        parent_x = self.winfo_rootx()
+        parent_y = self.winfo_rooty()
+        parent_w = self.winfo_width()
+        parent_h = self.winfo_height()
+        dialog_w = dlg.winfo_width()
+        dialog_h = dlg.winfo_height()
+        x = parent_x + max(0, (parent_w - dialog_w) // 2)
+        y = parent_y + max(0, (parent_h - dialog_h) // 2)
+        dlg.geometry(f"+{x}+{y}")
+
+        dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+        dlg.wait_window()
+        return result["ok"]
+
     def _update_eta(self, done: int, total: int) -> None:
         if total <= 0:
             self.eta_label.configure(text="预计剩余: --")
@@ -2110,6 +2575,7 @@ class PgloaderGUI(tk.Tk):
         state = tk.DISABLED if running else tk.NORMAL
         self.run_structure_button.configure(state=tk.DISABLED if running else tk.NORMAL)
         self.run_data_button.configure(state=tk.DISABLED if running else tk.NORMAL)
+        self.run_view_button.configure(state=tk.DISABLED if running else tk.NORMAL)
         self.run_full_button.configure(state=tk.DISABLED if running else tk.NORMAL)
         self.stop_button.configure(state=tk.NORMAL if running else tk.DISABLED)
 
@@ -2270,20 +2736,51 @@ class PgloaderGUI(tk.Tk):
         threading.Thread(target=self._refresh_tables_async, args=(db,), daemon=True).start()
 
     def _refresh_tables_async(self, db: str) -> None:
-        mysql_container = self.mysql_container.get().strip()
-        mysql_user = self.mysql_user.get().strip()
-        mysql_password = self.mysql_password.get()
-        tables = get_mysql_tables(mysql_container, mysql_user, mysql_password, db)
+        mysql_cfg = {
+            "container": self.mysql_container.get().strip(),
+            "user": self.mysql_user.get().strip(),
+            "password": self.mysql_password.get(),
+        }
+        source_uri = self.source_uri.get().strip()
+        conn = resolve_mysql_conn({"mysql": mysql_cfg, "source": {"uri": source_uri}}, db)
+        tables = get_mysql_tables(
+            str(conn.get("container", "")),
+            str(conn.get("user", "")),
+            str(conn.get("password", "")),
+            db,
+            host=str(conn.get("host", "")),
+            port=int(conn.get("port", 0) or 0),
+        )
         self.queue.put(("table_list", db, tables))
 
     def _refresh_databases(self) -> None:
         threading.Thread(target=self._refresh_databases_async, daemon=True).start()
 
     def _refresh_databases_async(self) -> None:
-        mysql_container = self.mysql_container.get().strip()
-        mysql_user = self.mysql_user.get().strip()
-        mysql_password = self.mysql_password.get()
-        source_dbs = get_mysql_databases(mysql_container, mysql_user, mysql_password)
+        mysql_cfg = {
+            "container": self.mysql_container.get().strip(),
+            "user": self.mysql_user.get().strip(),
+            "password": self.mysql_password.get(),
+        }
+        source_uri = self.source_uri.get().strip()
+        source_dbs: list[str] = []
+        parsed_source = None
+        if source_uri:
+            try:
+                parsed_source = parse_db_uri(source_uri.replace("{{DB_NAME}}", "mysql"))
+            except Exception:
+                parsed_source = None
+        if parsed_source and str(parsed_source.get("scheme", "")).lower() not in ("", "mysql"):
+            self.queue.put(("log", f"源库 URI 不是 mysql://，当前为 {parsed_source.get('scheme')}://，无法刷新 MySQL 源库列表。\n"))
+        else:
+            conn = resolve_mysql_conn({"mysql": mysql_cfg, "source": {"uri": source_uri}}, "mysql")
+            source_dbs = get_mysql_databases(
+                str(conn.get("container", "")),
+                str(conn.get("user", "")),
+                str(conn.get("password", "")),
+                host=str(conn.get("host", "")),
+                port=int(conn.get("port", 0) or 0),
+            )
         if not source_dbs:
             source_dbs = list(self.fallback_databases)
 
@@ -2335,26 +2832,38 @@ class PgloaderGUI(tk.Tk):
         if self.source_type.get().strip() != "mysql":
             self.queue.put(("size", 0))
         else:
-            mysql_container = self.mysql_container.get().strip()
-            mysql_user = self.mysql_user.get().strip()
-            mysql_password = self.mysql_password.get()
+            mysql_cfg = {
+                "container": self.mysql_container.get().strip(),
+                "user": self.mysql_user.get().strip(),
+                "password": self.mysql_password.get(),
+            }
+            source_uri = self.source_uri.get().strip()
             total_bytes = 0
             total_tables = 0
             for db in dbs:
+                conn = resolve_mysql_conn({"mysql": mysql_cfg, "source": {"uri": source_uri}}, db)
                 cmd = [
                     "docker",
                     "exec",
-                    mysql_container,
+                    str(conn.get("container", "")),
                     "mysql",
-                    f"-u{mysql_user}",
-                    f"-p{mysql_password}",
+                    f"-u{str(conn.get('user', ''))}",
+                    f"-p{str(conn.get('password', ''))}",
                     "-N",
+                ]
+                host = str(conn.get("host", ""))
+                port = int(conn.get("port", 0) or 0)
+                if host:
+                    cmd.extend(["-h", host])
+                if port:
+                    cmd.extend(["-P", str(port)])
+                cmd.extend([
                     "-e",
                     (
                         "SELECT COUNT(*), COALESCE(SUM(data_length + index_length), 0) "
                         f"FROM information_schema.tables WHERE table_schema='{db}';"
                     ),
-                ]
+                ])
                 result = run_command(cmd)
                 if result.returncode != 0:
                     continue

@@ -107,7 +107,43 @@ def run_command(
     return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
 
 
-def get_total_tables(mysql_container: str, user: str, password: str, db: str) -> int:
+def normalize_db_uri(uri: str) -> str:
+    text = (uri or "").strip()
+    if not text:
+        return ""
+    # Fix common typo like mysql:/host/db -> mysql://host/db
+    return re.sub(r"^([a-zA-Z][a-zA-Z0-9+.-]*):/(?!/)", r"\1://", text)
+
+
+def resolve_mysql_conn(config: Dict, db: str) -> Dict[str, str | int]:
+    mysql_cfg = config.get("mysql", {})
+    source_uri = normalize_db_uri((config.get("source", {}).get("uri") or "").replace("{{DB_NAME}}", db))
+
+    host = ""
+    port = 0
+    user = str(mysql_cfg.get("user", ""))
+    password = str(mysql_cfg.get("password", ""))
+
+    try:
+        source = parse_db_uri(source_uri)
+        if str(source.get("scheme", "")).lower() == "mysql":
+            host = str(source.get("host", "") or "")
+            port = int(source.get("port", 0) or 0)
+            user = str(source.get("user", "") or user)
+            password = str(source.get("password", "") or password)
+    except Exception:
+        pass
+
+    return {
+        "container": str(mysql_cfg.get("container", "")),
+        "host": host,
+        "port": port,
+        "user": user,
+        "password": password,
+    }
+
+
+def get_total_tables(mysql_container: str, user: str, password: str, db: str, host: str = "", port: int = 0) -> int:
     cmd = [
         "docker",
         "exec",
@@ -116,9 +152,15 @@ def get_total_tables(mysql_container: str, user: str, password: str, db: str) ->
         f"-u{user}",
         f"-p{password}",
         "-N",
+    ]
+    if host:
+        cmd.extend(["-h", host])
+    if port:
+        cmd.extend(["-P", str(port)])
+    cmd.extend([
         "-e",
         f"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='{db}';",
-    ]
+    ])
     result = run_command(cmd)
     if result.returncode != 0:
         return 0
@@ -287,7 +329,7 @@ def clear_target_public_tables(db: str, config: Dict, selected_tables: Optional[
     return result.returncode
 
 
-def get_mysql_tables(mysql_container: str, user: str, password: str, db: str) -> List[str]:
+def get_mysql_tables(mysql_container: str, user: str, password: str, db: str, host: str = "", port: int = 0) -> List[str]:
     cmd = [
         "docker",
         "exec",
@@ -296,19 +338,25 @@ def get_mysql_tables(mysql_container: str, user: str, password: str, db: str) ->
         f"-u{user}",
         f"-p{password}",
         "-N",
+    ]
+    if host:
+        cmd.extend(["-h", host])
+    if port:
+        cmd.extend(["-P", str(port)])
+    cmd.extend([
         "-e",
         (
             "SELECT table_name FROM information_schema.tables "
             f"WHERE table_schema='{db}' AND table_type='BASE TABLE' ORDER BY table_name;"
         ),
-    ]
+    ])
     result = run_command(cmd)
     if result.returncode != 0:
         return []
     return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 
 
-def get_mysql_columns(mysql_container: str, user: str, password: str, db: str, table: str) -> List[str]:
+def get_mysql_views(mysql_container: str, user: str, password: str, db: str, host: str = "", port: int = 0) -> List[str]:
     cmd = [
         "docker",
         "exec",
@@ -317,19 +365,296 @@ def get_mysql_columns(mysql_container: str, user: str, password: str, db: str, t
         f"-u{user}",
         f"-p{password}",
         "-N",
+    ]
+    if host:
+        cmd.extend(["-h", host])
+    if port:
+        cmd.extend(["-P", str(port)])
+    cmd.extend([
+        "-e",
+        (
+            "SELECT table_name FROM information_schema.views "
+            f"WHERE table_schema='{db}' ORDER BY table_name;"
+        ),
+    ])
+    result = run_command(cmd)
+    if result.returncode != 0:
+        return []
+    return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+
+
+def get_mysql_view_definition(
+    mysql_container: str,
+    user: str,
+    password: str,
+    db: str,
+    view_name: str,
+    host: str = "",
+    port: int = 0,
+) -> str:
+    cmd = [
+        "docker",
+        "exec",
+        mysql_container,
+        "mysql",
+        f"-u{user}",
+        f"-p{password}",
+        "-N",
+    ]
+    if host:
+        cmd.extend(["-h", host])
+    if port:
+        cmd.extend(["-P", str(port)])
+    cmd.extend([
+        "-e",
+        (
+            "SELECT view_definition FROM information_schema.views "
+            f"WHERE table_schema='{db}' AND table_name='{view_name}';"
+        ),
+    ])
+    result = run_command(cmd)
+    if result.returncode != 0:
+        return ""
+    lines = [line.rstrip("\r") for line in (result.stdout or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    return "\n".join(lines)
+
+
+def transform_mysql_view_definition(view_sql: str, source_db: str) -> str:
+    transformed = (view_sql or "").strip().rstrip(";")
+    if not transformed:
+        return ""
+
+    # Drop source DB qualifier, then convert MySQL-style quoted identifiers.
+    transformed = re.sub(rf"`{re.escape(source_db)}`\.", "", transformed, flags=re.IGNORECASE)
+    transformed = re.sub(rf"\b{re.escape(source_db)}\.", "", transformed, flags=re.IGNORECASE)
+
+    def _replace_bt_ident(match: re.Match[str]) -> str:
+        return pg_quote_ident(match.group(1).lower())
+
+    def _replace_year_func(match: re.Match[str]) -> str:
+        expr = match.group(1).strip()
+        return f"EXTRACT(YEAR FROM {expr})"
+
+    def _replace_month_func(match: re.Match[str]) -> str:
+        expr = match.group(1).strip()
+        return f"EXTRACT(MONTH FROM {expr})"
+
+    def _replace_quarter_func(match: re.Match[str]) -> str:
+        expr = match.group(1).strip()
+        return f"EXTRACT(QUARTER FROM {expr})"
+
+    transformed = re.sub(r"`([^`]+)`", _replace_bt_ident, transformed)
+    transformed = re.sub(r"\bIFNULL\(", "COALESCE(", transformed, flags=re.IGNORECASE)
+    transformed = re.sub(r"\bYEAR\s*\(\s*([^\(\)]+?)\s*\)", _replace_year_func, transformed, flags=re.IGNORECASE)
+    transformed = re.sub(r"\bMONTH\s*\(\s*([^\(\)]+?)\s*\)", _replace_month_func, transformed, flags=re.IGNORECASE)
+    transformed = re.sub(r"\bQUARTER\s*\(\s*([^\(\)]+?)\s*\)", _replace_quarter_func, transformed, flags=re.IGNORECASE)
+    return transformed
+
+
+def run_pg_sql(db: str, config: Dict, sql: str) -> int:
+    target_cfg = config.get("target", {})
+    target_uri = target_cfg.get("uri", "").replace("{{DB_NAME}}", db)
+    target = parse_db_uri(target_uri)
+
+    if target.get("scheme") not in ("postgresql", "pgsql", "postgres"):
+        print(f"Skip execute sql: unsupported target scheme {target.get('scheme')}")
+        return 1
+
+    pg_user = str(target.get("user", ""))
+    pg_db = str(target.get("database", ""))
+    pg_host = str(target.get("host", ""))
+    pg_port = str(target.get("port", 5432) or 5432)
+    psql_container = (target_cfg.get("psql_container") or "postgres16").strip()
+
+    container_cmd = [
+        "docker",
+        "exec",
+        "-e",
+        f"PGPASSWORD={str(target.get('password', ''))}",
+        psql_container,
+        "psql",
+        "-h",
+        pg_host,
+        "-p",
+        pg_port,
+        "-U",
+        pg_user,
+        "-d",
+        pg_db,
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-q",
+        "-c",
+        sql,
+    ]
+
+    container_result = run_command(container_cmd)
+    if container_result.returncode == 0:
+        return 0
+
+    psql_cmd = target_cfg.get("psql", "psql")
+    local_cmd = [
+        psql_cmd,
+        "-h",
+        pg_host,
+        "-p",
+        pg_port,
+        "-U",
+        pg_user,
+        "-d",
+        pg_db,
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-q",
+        "-c",
+        sql,
+    ]
+
+    cmd_env = os.environ.copy()
+    password = str(target.get("password", ""))
+    if password:
+        cmd_env["PGPASSWORD"] = password
+
+    result = run_command(local_cmd, env=cmd_env)
+    if result.returncode != 0:
+        if container_result.stdout:
+            sys.stdout.write(container_result.stdout)
+        if container_result.stderr:
+            sys.stdout.write(container_result.stderr)
+        if result.stdout:
+            sys.stdout.write(result.stdout)
+        if result.stderr:
+            sys.stdout.write(result.stderr)
+    return result.returncode
+
+
+def sync_views_for_db(db: str, config: Dict) -> int:
+    mysql_conn = resolve_mysql_conn(config, db)
+    views = get_mysql_views(
+        str(mysql_conn.get("container", "")),
+        str(mysql_conn.get("user", "")),
+        str(mysql_conn.get("password", "")),
+        db,
+        host=str(mysql_conn.get("host", "")),
+        port=int(mysql_conn.get("port", 0) or 0),
+    )
+    if not views:
+        print(f"View sync skipped: no views found in {db}")
+        return 0
+
+    print(f"View sync start: {db}, views={len(views)}")
+    print(f"Source view list ({db}): {', '.join(views)}")
+    view_sql_map: Dict[str, str] = {}
+    for view_name in views:
+        raw_definition = get_mysql_view_definition(
+            str(mysql_conn.get("container", "")),
+            str(mysql_conn.get("user", "")),
+            str(mysql_conn.get("password", "")),
+            db,
+            view_name,
+            host=str(mysql_conn.get("host", "")),
+            port=int(mysql_conn.get("port", 0) or 0),
+        )
+        if not raw_definition:
+            print(f"View sync skipped: {db}.{view_name} (empty definition)")
+            continue
+
+        definition = transform_mysql_view_definition(raw_definition, db)
+        if not definition:
+            print(f"View sync skipped: {db}.{view_name} (unsupported definition)")
+            continue
+
+        view_sql_map[view_name] = definition
+
+    if not view_sql_map:
+        print(f"View sync skipped: no valid view definitions in {db}")
+        return 0
+
+    pending = list(view_sql_map.keys())
+    total_valid = len(pending)
+    synced_count = 0
+    round_no = 0
+
+    while pending:
+        round_no += 1
+        round_progress = 0
+        next_pending: List[str] = []
+        print(f"View sync round {round_no}: pending={len(pending)}")
+
+        for view_name in pending:
+            definition = view_sql_map[view_name]
+
+            view_ident = pg_quote_ident(view_name.lower())
+            sql = f"CREATE OR REPLACE VIEW public.{view_ident} AS {definition};"
+            code = run_pg_sql(db, config, sql)
+            if code != 0:
+                next_pending.append(view_name)
+                continue
+
+            synced_count += 1
+            round_progress += 1
+            print(f"View synced: {db}.{view_name} [{synced_count}/{total_valid}]")
+
+        if not next_pending:
+            print(f"View sync success: {db}")
+            return 0
+
+        if round_progress == 0:
+            unresolved = ", ".join(next_pending)
+            print(f"View sync failed: unresolved dependent or incompatible views in {db}: {unresolved}")
+            return 1
+
+        pending = next_pending
+
+    print(f"View sync success: {db}")
+    return 0
+
+
+def get_mysql_columns(
+    mysql_container: str,
+    user: str,
+    password: str,
+    db: str,
+    table: str,
+    host: str = "",
+    port: int = 0,
+) -> List[str]:
+    cmd = [
+        "docker",
+        "exec",
+        mysql_container,
+        "mysql",
+        f"-u{user}",
+        f"-p{password}",
+        "-N",
+    ]
+    if host:
+        cmd.extend(["-h", host])
+    if port:
+        cmd.extend(["-P", str(port)])
+    cmd.extend([
         "-e",
         (
             "SELECT column_name FROM information_schema.columns "
             f"WHERE table_schema='{db}' AND table_name='{table}' ORDER BY ordinal_position;"
         ),
-    ]
+    ])
     result = run_command(cmd)
     if result.returncode != 0:
         return []
     return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 
 
-def get_mysql_primary_key_map(mysql_container: str, user: str, password: str, db: str) -> Dict[str, List[str]]:
+def get_mysql_primary_key_map(
+    mysql_container: str,
+    user: str,
+    password: str,
+    db: str,
+    host: str = "",
+    port: int = 0,
+) -> Dict[str, List[str]]:
     cmd = [
         "docker",
         "exec",
@@ -338,6 +663,12 @@ def get_mysql_primary_key_map(mysql_container: str, user: str, password: str, db
         f"-u{user}",
         f"-p{password}",
         "-N",
+    ]
+    if host:
+        cmd.extend(["-h", host])
+    if port:
+        cmd.extend(["-P", str(port)])
+    cmd.extend([
         "-e",
         (
             "SELECT tc.table_name, k.column_name "
@@ -349,7 +680,7 @@ def get_mysql_primary_key_map(mysql_container: str, user: str, password: str, db
             f"WHERE tc.constraint_type='PRIMARY KEY' AND tc.table_schema='{db}' "
             "ORDER BY tc.table_name, k.ordinal_position;"
         ),
-    ]
+    ])
     result = run_command(cmd)
     if result.returncode != 0:
         return {}
@@ -403,12 +734,14 @@ def build_add_primary_keys_sql(pk_map: Dict[str, List[str]]) -> str:
 
 
 def ensure_target_primary_keys(db: str, config: Dict, selected_tables: Optional[List[str]] = None) -> int:
-    mysql_cfg = config.get("mysql", {})
+    mysql_conn = resolve_mysql_conn(config, db)
     pk_map = get_mysql_primary_key_map(
-        mysql_cfg.get("container", ""),
-        mysql_cfg.get("user", ""),
-        mysql_cfg.get("password", ""),
+        str(mysql_conn.get("container", "")),
+        str(mysql_conn.get("user", "")),
+        str(mysql_conn.get("password", "")),
         db,
+        host=str(mysql_conn.get("host", "")),
+        port=int(mysql_conn.get("port", 0) or 0),
     )
     selected = parse_selected_tables(selected_tables)
     if selected:
@@ -501,7 +834,15 @@ def ensure_target_primary_keys(db: str, config: Dict, selected_tables: Optional[
     return result.returncode
 
 
-def get_mysql_split_pk(mysql_container: str, user: str, password: str, db: str, table: str) -> Optional[str]:
+def get_mysql_split_pk(
+    mysql_container: str,
+    user: str,
+    password: str,
+    db: str,
+    table: str,
+    host: str = "",
+    port: int = 0,
+) -> Optional[str]:
     cmd = [
         "docker",
         "exec",
@@ -510,6 +851,12 @@ def get_mysql_split_pk(mysql_container: str, user: str, password: str, db: str, 
         f"-u{user}",
         f"-p{password}",
         "-N",
+    ]
+    if host:
+        cmd.extend(["-h", host])
+    if port:
+        cmd.extend(["-P", str(port)])
+    cmd.extend([
         "-e",
         (
             "SELECT k.column_name, c.data_type FROM information_schema.table_constraints tc "
@@ -524,7 +871,7 @@ def get_mysql_split_pk(mysql_container: str, user: str, password: str, db: str, 
             f"WHERE tc.constraint_type='PRIMARY KEY' AND tc.table_schema='{db}' AND tc.table_name='{table}' "
             "ORDER BY k.ordinal_position;"
         ),
-    ]
+    ])
     result = run_command(cmd)
     if result.returncode != 0:
         return None
@@ -790,16 +1137,18 @@ def run_datax_for_db(db: str, config: Dict, workspace: str, selected_tables: Opt
     datax_cmd_cfg = dict(datax_cfg)
     datax_cmd_cfg["home"] = datax_home
 
-    mysql_cfg = config.get("mysql", {})
+    mysql_conn = resolve_mysql_conn(config, db)
     source_uri_template = datax_cfg.get("source_uri") or config.get("source", {}).get("uri", "")
-    source_uri = source_uri_template.replace("{{DB_NAME}}", db)
-    target_uri = config.get("target", {}).get("uri", "").replace("{{DB_NAME}}", db)
+    source_uri = normalize_db_uri(source_uri_template.replace("{{DB_NAME}}", db))
+    target_uri = normalize_db_uri(config.get("target", {}).get("uri", "").replace("{{DB_NAME}}", db))
 
     tables = get_mysql_tables(
-        mysql_cfg.get("container", ""),
-        mysql_cfg.get("user", ""),
-        mysql_cfg.get("password", ""),
+        str(mysql_conn.get("container", "")),
+        str(mysql_conn.get("user", "")),
+        str(mysql_conn.get("password", "")),
         db,
+        host=str(mysql_conn.get("host", "")),
+        port=int(mysql_conn.get("port", 0) or 0),
     )
     if not tables:
         print(f"DataX skipped: no tables found in {db}")
@@ -840,11 +1189,13 @@ def run_datax_for_db(db: str, config: Dict, workspace: str, selected_tables: Opt
 
     def run_one_table(idx: int, table: str) -> tuple[int, str, List[str], str]:
         columns = get_mysql_columns(
-            mysql_cfg.get("container", ""),
-            mysql_cfg.get("user", ""),
-            mysql_cfg.get("password", ""),
+            str(mysql_conn.get("container", "")),
+            str(mysql_conn.get("user", "")),
+            str(mysql_conn.get("password", "")),
             db,
             table,
+            host=str(mysql_conn.get("host", "")),
+            port=int(mysql_conn.get("port", 0) or 0),
         )
         if not columns:
             with output_lock:
@@ -852,11 +1203,13 @@ def run_datax_for_db(db: str, config: Dict, workspace: str, selected_tables: Opt
             return 0, table, [], ""
 
         split_pk = get_mysql_split_pk(
-            mysql_cfg.get("container", ""),
-            mysql_cfg.get("user", ""),
-            mysql_cfg.get("password", ""),
+            str(mysql_conn.get("container", "")),
+            str(mysql_conn.get("user", "")),
+            str(mysql_conn.get("password", "")),
             db,
             table,
+            host=str(mysql_conn.get("host", "")),
+            port=int(mysql_conn.get("port", 0) or 0),
         )
 
         channel = int(datax_cfg.get("channel", 2))
@@ -953,7 +1306,7 @@ def run_pgloader_for_db(
     workspace: str,
     selected_tables: Optional[List[str]] = None,
 ) -> int:
-    mysql_cfg = config.get("mysql", {})
+    mysql_conn = resolve_mysql_conn(config, db)
     pgloader_cfg = config["pgloader"]
     source_cfg = config.get("source", {})
     target_cfg = config.get("target", {})
@@ -975,10 +1328,12 @@ def run_pgloader_for_db(
     if source_type == "mysql":
         if selected:
             all_tables = get_mysql_tables(
-                mysql_cfg.get("container", ""),
-                mysql_cfg.get("user", ""),
-                mysql_cfg.get("password", ""),
+                str(mysql_conn.get("container", "")),
+                str(mysql_conn.get("user", "")),
+                str(mysql_conn.get("password", "")),
                 db,
+                host=str(mysql_conn.get("host", "")),
+                port=int(mysql_conn.get("port", 0) or 0),
             )
             selected_found, missing_tables = filter_tables_by_selected(all_tables, selected)
             if missing_tables:
@@ -990,14 +1345,16 @@ def run_pgloader_for_db(
             table_filter_clause = build_pgloader_table_filter_clause(selected_found)
         else:
             total_tables = get_total_tables(
-                mysql_cfg.get("container", ""),
-                mysql_cfg.get("user", ""),
-                mysql_cfg.get("password", ""),
+                str(mysql_conn.get("container", "")),
+                str(mysql_conn.get("user", "")),
+                str(mysql_conn.get("password", "")),
                 db,
+                host=str(mysql_conn.get("host", "")),
+                port=int(mysql_conn.get("port", 0) or 0),
             )
 
-    source_uri = source_cfg.get("uri", "").replace("{{DB_NAME}}", db)
-    target_uri = target_cfg.get("uri", "").replace("{{DB_NAME}}", db)
+    source_uri = normalize_db_uri(source_cfg.get("uri", "").replace("{{DB_NAME}}", db))
+    target_uri = normalize_db_uri(target_cfg.get("uri", "").replace("{{DB_NAME}}", db))
 
     template_path = os.path.join(workspace, config["load_template"])
     rendered_name = f".pgloader_rendered_{db}.load"
@@ -1084,6 +1441,13 @@ def run_pgloader_for_db(
         if pk_code != 0:
             print(f"Failed to ensure primary keys on target: {db}")
             return pk_code
+
+    sync_views_enabled = bool(pgloader_cfg.get("sync_views", True))
+    if sync_views_enabled:
+        view_code = sync_views_for_db(db, config)
+        if view_code != 0:
+            print(f"Failed to sync views on target: {db}")
+            return view_code
 
     return code
 

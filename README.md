@@ -2,6 +2,7 @@
 
 FastDBConvert 是一个 MySQL → PostgreSQL 迁移工具：
 - 结构同步使用 `pgloader`
+- 视图同步在结构阶段后自动执行（MySQL View -> PostgreSQL View）
 - 数据同步使用 DataX 工具包
 - 结构/数据分开执行（先结构，后数据）
 
@@ -102,6 +103,7 @@ Test-Path .\datax\datax\bin\datax.py
 
 - `pgloader.image` 必须是 `dimitri/pgloader:v3.6.7`
 - `pgloader.ensure_primary_keys=true`：结构同步后自动为目标库补齐缺失主键
+- `pgloader.sync_views=true`：结构同步后自动同步 MySQL 视图到目标库 `public`
 - `target.psql_container` 默认 `postgres16`
 - `datax.home` 默认 `datax/datax`
 - `datax.source_uri` 建议本机模式使用 `127.0.0.1`
@@ -134,9 +136,10 @@ GUI 操作顺序：
 GUI 新增能力（v3.0.0）：
 
 - 支持“同步历史记录”页签：记录当前机器已执行的同步任务（源数据库、目标数据库、同步时间、同步结果、同步耗时），并支持“清空历史”。
-- 支持“全同步数据库池”与“全同步”按钮：将选中的数据库加入池后，可按顺序自动执行每个数据库的“结构同步 → 数据同步”。
+- 支持“全同步数据库池”与“全同步”按钮：将选中的数据库加入池后，可按顺序自动执行每个数据库的“结构同步 → 主键同步 → 视图同步 → 数据同步”。
 - 全同步流程中：
    - 结构同步前先清空目标库 `public` 表结构（与单独结构同步一致）。
+   - 结构同步后自动执行主键补齐与视图同步。
    - 数据同步前先清空目标库表数据（`TRUNCATE ... RESTART IDENTITY CASCADE`），再执行 DataX。
 - 底部“预计剩余”支持按当前速度估算整个流程耗时（粗略估算，随实时速度动态更新）。
 
@@ -147,6 +150,8 @@ GUI 新增能力（v3.0.0）：
 ```powershell
 python .\pgloader_tool.py --action structure --db iucp_normal
 ```
+
+说明：`--action structure` 现在包含“表结构同步 + 主键补齐 + 视图同步”。
 
 数据同步：
 
@@ -174,6 +179,7 @@ GUI 中也支持单表/多表迁移：先选中一个数据库，点击“刷新
 说明：
 - 若未选表，结构同步前仍会清理目标库 `public` 下全部表。
 - 若已选单表/多表，结构同步前只清理目标库 `public` 下对应的选中表。
+- 视图同步默认同步该库全部视图（与 `--table` 选表无关）。
 - 表较多时可使用 GUI 的“表过滤”搜索框，并支持“全选”“清空选择”。
 
 ## 7. 容器示例（本地演示场景）
