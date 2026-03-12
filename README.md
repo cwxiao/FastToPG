@@ -6,6 +6,12 @@ FastDBConvert 是一个 MySQL → PostgreSQL 迁移工具：
 - 数据同步使用 DataX 工具包
 - 结构/数据分开执行（先结构，后数据）
 
+当前 GUI 支持 4 种运行模式：
+- 同步结构
+- 同步数据
+- 同步视图（单独执行）
+- 全同步（结构 -> 主键 -> 视图 -> 数据）
+
 > 重要：从 v3.0.0 开始，`datax/` 目录不再作为代码仓库内容提交，改为通过 GitHub Release 附件提供。
 
 ## 1. 版本与依赖（精确）
@@ -102,6 +108,7 @@ Test-Path .\datax\datax\bin\datax.py
 编辑 `pgloader_tool.json`：
 
 - `pgloader.image` 必须是 `dimitri/pgloader:v3.6.7`
+- `pgloader.clear_public_before_sync=true`：结构同步前先清理目标库 `public` 表
 - `pgloader.ensure_primary_keys=true`：结构同步后自动为目标库补齐缺失主键
 - `pgloader.sync_views=true`：结构同步后自动同步 MySQL 视图到目标库 `public`
 - `target.psql_container` 默认 `postgres16`
@@ -111,6 +118,8 @@ Test-Path .\datax\datax\bin\datax.py
 - `datax.cleanup_jobs_on_finish=true`：无论成功/失败都清理 DataX job 临时文件
 - `datax.log_retention_days` 与 `datax.log_dirs`：自动清理过期日志
 - `pgloader.cleanup_temp_files=true`：自动清理 `.pgloader_rendered_*.load` 临时文件
+
+说明：GUI 在运行任务时会组装一份运行态配置（例如全同步时自动开启“数据同步前清空目标表数据”），不要求你手动在 `pgloader_tool.json` 中维护这些临时开关。
 
 ## 6. 部署与运行全流程（推荐）
 
@@ -137,9 +146,14 @@ GUI 新增能力（v3.0.0）：
 
 - 支持“同步历史记录”页签：记录当前机器已执行的同步任务（源数据库、目标数据库、同步时间、同步结果、同步耗时），并支持“清空历史”。
 - 支持“全同步数据库池”与“全同步”按钮：将选中的数据库加入池后，可按顺序自动执行每个数据库的“结构同步 → 主键同步 → 视图同步 → 数据同步”。
+- 支持“同步视图”按钮：单独执行视图同步；执行前会弹窗确认，并先清理目标库 `public` 下全部视图。
+- 支持数据库 URI 历史：`源连接 URI`、`目标连接 URI`、`DataX 源URI` 都可通过“历史”按钮回填；支持删除历史项（本机保存于 `uri_history.json`，最多保留 200 条）。
+- 支持同步历史持久化：本机保存于 `sync_history.json`，最多保留 1000 条。
+- 主页支持“停止”按钮，可中断当前 `pgloader`/DataX 进程（及并行子任务）。
+- 主页支持实时统计：显示“已选数据库大小”、目标库 `public` 表数量和数据量，并周期刷新。
 - 全同步流程中：
    - 结构同步前先清空目标库 `public` 表结构（与单独结构同步一致）。
-   - 结构同步后自动执行主键补齐与视图同步。
+   - 全同步的结构阶段会自动禁用外键创建，再按“结构 -> 主键 -> 视图 -> 数据”顺序执行，减少跨阶段依赖问题。
    - 数据同步前先清空目标库表数据（`TRUNCATE ... RESTART IDENTITY CASCADE`），再执行 DataX。
 - 底部“预计剩余”支持按当前速度估算整个流程耗时（粗略估算，随实时速度动态更新）。
 
@@ -152,6 +166,8 @@ python .\pgloader_tool.py --action structure --db iucp_normal
 ```
 
 说明：`--action structure` 现在包含“表结构同步 + 主键补齐 + 视图同步”。
+
+说明：CLI 当前只支持 `structure` / `data` 两种 action；`view` 与 `full` 为 GUI 模式。
 
 数据同步：
 
@@ -181,6 +197,7 @@ GUI 中也支持单表/多表迁移：先选中一个数据库，点击“刷新
 - 若已选单表/多表，结构同步前只清理目标库 `public` 下对应的选中表。
 - 视图同步默认同步该库全部视图（与 `--table` 选表无关）。
 - 表较多时可使用 GUI 的“表过滤”搜索框，并支持“全选”“清空选择”。
+- 无论 CLI 还是 GUI，指定 `--table` / 选表后都只能同时处理一个数据库。
 
 ## 7. 容器示例（本地演示场景）
 
@@ -195,7 +212,9 @@ docker run -d --name postgres16 -e POSTGRES_PASSWORD=postgres -p 5432:5432 postg
 
 ## 8. 日志与临时文件策略（v3.0.0）
 
+- DataX 任务开始前会按 `log_retention_days` 清理过期日志目录（默认 `datax/datax/log`、`datax/datax/log_perf`）
 - DataX job 文件：任务结束后自动清理（成功/失败都清理）
+- 若 `.datax_jobs` 目录已空，会自动清理空目录
 - pgloader 渲染临时文件：任务结束后自动清理（成功/失败都清理）
 - DataX 日志目录：按 `log_retention_days` 自动清理过期日志
 
@@ -207,3 +226,5 @@ docker run -d --name postgres16 -e POSTGRES_PASSWORD=postgres -p 5432:5432 postg
    - 确认 `clear_public_before_sync=true` 且目标库可执行 `DROP TABLE`。
 3. **推送仓库过慢或失败**
    - 不要提交 `datax/` 目录及压缩包，DataX 通过 Release 附件分发。
+4. **URI 写成 `mysql:/host/db` 这类格式**
+   - 工具会自动纠正常见少斜杠写法为 `mysql://...`，但仍建议在配置中使用标准 URI，避免歧义。
