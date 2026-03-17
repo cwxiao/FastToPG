@@ -375,6 +375,54 @@ def get_mysql_columns(
         return []
     return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 
+def get_mysql_column_defs(
+    mysql_container: str,
+    user: str,
+    password: str,
+    db: str,
+    table: str,
+    host: str = "",
+    port: int = 0,
+) -> list[dict[str, str]]:
+    cmd = [
+        "docker",
+        "exec",
+        mysql_container,
+        "mysql",
+        f"-u{user}",
+        f"-p{password}",
+        "-N",
+    ]
+    if host:
+        cmd.extend(["-h", host])
+    if port:
+        cmd.extend(["-P", str(port)])
+    cmd.extend([
+        "-e",
+        (
+            "SELECT column_name, data_type FROM information_schema.columns "
+            f"WHERE table_schema='{db}' AND table_name='{table}' ORDER BY ordinal_position;"
+        ),
+    ])
+    result = run_command(cmd)
+    if result.returncode != 0:
+        return []
+
+    column_defs: list[dict[str, str]] = []
+    for line in (result.stdout or "").splitlines():
+        row = line.strip()
+        if not row:
+            continue
+        parts = row.split("\t")
+        if len(parts) < 2:
+            continue
+        column_name = parts[0].strip()
+        data_type = parts[1].strip().lower()
+        if not column_name:
+            continue
+        column_defs.append({"name": column_name, "data_type": data_type})
+    return column_defs
+
 def get_mysql_primary_key_map(
     mysql_container: str,
     user: str,
@@ -539,6 +587,79 @@ def clear_target_public_table_data(db: str, config: dict, selected_tables: list[
     if code == 0:
         return 0, prefix + out
     return code, prefix + out
+
+def get_target_json_columns(db: str, config: dict, selected_tables: list[str] | None = None) -> tuple[int, dict[str, list[str]], str]:
+    target_cfg = config.get("target", {})
+    target_uri = target_cfg.get("uri", "").replace("{{DB_NAME}}", db)
+    target = parse_db_uri(target_uri)
+
+    if target.get("scheme") not in ("postgresql", "pgsql", "postgres"):
+        return 1, {}, f"Skip inspect target json columns: unsupported target scheme {target.get('scheme')}\n"
+
+    selected = parse_selected_tables(selected_tables)
+    filter_sql = ""
+    if selected:
+        literals = ", ".join(sql_quote_literal(name.lower()) for name in selected)
+        filter_sql = f" AND table_name IN ({literals})"
+
+    sql = (
+        "COPY ("
+        "SELECT table_name, column_name FROM information_schema.columns "
+        "WHERE table_schema='public' AND data_type IN ('json', 'jsonb')"
+        f"{filter_sql} "
+        "ORDER BY table_name, ordinal_position"
+        ") TO STDOUT WITH DELIMITER E'\t';"
+    )
+    code, out = run_psql_container_sql(target, target_cfg, sql)
+    if code != 0:
+        return code, {}, out
+
+    json_columns: dict[str, list[str]] = {}
+    for line in (out or "").splitlines():
+        row = line.strip()
+        if not row or row.startswith("容器 psql"):
+            continue
+        parts = row.split("\t")
+        if len(parts) < 2:
+            continue
+        table_name = parts[0].strip()
+        column_name = parts[1].strip()
+        if not table_name or not column_name:
+            continue
+        json_columns.setdefault(table_name, []).append(column_name)
+    return 0, json_columns, out
+
+def coerce_target_json_columns_to_text(db: str, config: dict, selected_tables: list[str] | None = None) -> tuple[int, str]:
+    target_cfg = config.get("target", {})
+    target_uri = target_cfg.get("uri", "").replace("{{DB_NAME}}", db)
+    target = parse_db_uri(target_uri)
+
+    if target.get("scheme") not in ("postgresql", "pgsql", "postgres"):
+        return 1, f"Skip coerce target json columns: unsupported target scheme {target.get('scheme')}\n"
+
+    code, json_columns, detail = get_target_json_columns(db, config, selected_tables=selected_tables)
+    if code != 0:
+        return code, f"检查目标库 JSON 列失败: {db}\n{detail}"
+    if not json_columns:
+        return 0, f"目标库 JSON 列转换跳过: {db} (none)\n"
+
+    sql_blocks: list[str] = []
+    total_columns = 0
+    for table_name, columns in json_columns.items():
+        table_ident = pg_quote_ident(table_name)
+        for column_name in columns:
+            total_columns += 1
+            column_ident = pg_quote_ident(column_name)
+            sql_blocks.append(
+                f"ALTER TABLE public.{table_ident} ALTER COLUMN {column_ident} TYPE text USING {column_ident}::text;"
+            )
+
+    alter_sql = "\n".join(sql_blocks)
+    alter_code, out = run_psql_container_sql(target, target_cfg, alter_sql)
+    prefix = f"目标库 JSON 列转 text: {target.get('database', '')}，tables={len(json_columns)}，columns={total_columns}\n"
+    if alter_code == 0:
+        return 0, prefix + out
+    return alter_code, prefix + out
 
 def get_mysql_split_pk(
     mysql_container: str,

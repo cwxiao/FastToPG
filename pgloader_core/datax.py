@@ -12,6 +12,23 @@ def mysql_ident(name: str) -> str:
 def pg_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
+def build_mysql_query_sql(table: str, column_defs: list[dict[str, str]]) -> str:
+    select_items: list[str] = []
+    for column in column_defs:
+        name = str(column.get("name", "")).strip()
+        data_type = str(column.get("data_type", "")).strip().lower()
+        if not name:
+            continue
+        ident = mysql_ident(name)
+        if data_type == "json":
+            select_items.append(f"CAST({ident} AS CHAR) AS {ident}")
+        else:
+            select_items.append(ident)
+    return f"SELECT {', '.join(select_items)} FROM {mysql_ident(table)}"
+
+def has_mysql_json_columns(column_defs: list[dict[str, str]]) -> bool:
+    return any(str(column.get("data_type", "")).strip().lower() == "json" for column in column_defs)
+
 def build_datax_job(
     workspace: str,
     db: str,
@@ -21,6 +38,7 @@ def build_datax_job(
     target_uri: str,
     datax_cfg: dict,
     split_pk: str | None = None,
+    column_defs: list[dict[str, str]] | None = None,
 ) -> str:
     source = parse_db_uri(source_uri)
     target = parse_db_uri(target_uri)
@@ -35,6 +53,7 @@ def build_datax_job(
         sep = "&" if "?" in source_jdbc else "?"
         source_jdbc = f"{source_jdbc}{sep}{mysql_jdbc_params}"
     target_jdbc = f"jdbc:postgresql://{target['host']}:{target['port']}/{target['database']}"
+    normalized_column_defs = column_defs or [{"name": col, "data_type": ""} for col in columns]
     reader_columns = [mysql_ident(col) for col in columns]
     writer_columns = [
         pg_ident(col.lower() if bool(datax_cfg.get("target_column_lowercase", True)) else col)
@@ -55,10 +74,8 @@ def build_datax_job(
                         "parameter": {
                             "username": source["user"],
                             "password": source["password"],
-                            "column": reader_columns,
                             "connection": [
                                 {
-                                    "table": [mysql_ident(table)],
                                     "jdbcUrl": [source_jdbc],
                                 }
                             ],
@@ -84,7 +101,15 @@ def build_datax_job(
         }
     }
 
-    if split_pk:
+    reader_parameter = job["job"]["content"][0]["reader"]["parameter"]
+    reader_connection = reader_parameter["connection"][0]
+    if has_mysql_json_columns(normalized_column_defs):
+        reader_connection["querySql"] = [build_mysql_query_sql(table, normalized_column_defs)]
+    else:
+        reader_parameter["column"] = reader_columns
+        reader_connection["table"] = [mysql_ident(table)]
+
+    if split_pk and "querySql" not in reader_connection:
         job["job"]["content"][0]["reader"]["parameter"]["splitPk"] = split_pk
 
     job_folder = os.path.join(workspace, job_dir)

@@ -287,6 +287,13 @@ class SyncWorkerMixin:
                             push_db_history("失败")
                             self.queue.put(("failed", f"清理目标库表数据失败: {db}\n"))
                             return
+                    coerce_code, coerce_output = coerce_target_json_columns_to_text(db, config, selected_tables=selected_tables)
+                    if coerce_output:
+                        self.queue.put(("log", coerce_output + ("" if coerce_output.endswith("\n") else "\n")))
+                    if coerce_code != 0:
+                        push_db_history("失败")
+                        self.queue.put(("failed", f"转换目标库 JSON 列失败: {db}\n"))
+                        return
                     datax_cfg = config.get("datax", {})
                     if not bool(datax_cfg.get("enabled", False)):
                         push_db_history("失败")
@@ -340,7 +347,7 @@ class SyncWorkerMixin:
                         def run_one_table(t_idx: int, table: str) -> tuple[int, str, str, str]:
                             if self.stop_event.is_set():
                                 return 130, table, "", ""
-                            columns = get_mysql_columns(
+                            column_defs = get_mysql_column_defs(
                                 str(mysql_conn.get("container", "")),
                                 str(mysql_conn.get("user", "")),
                                 str(mysql_conn.get("password", "")),
@@ -349,6 +356,7 @@ class SyncWorkerMixin:
                                 host=str(mysql_conn.get("host", "")),
                                 port=int(mysql_conn.get("port", 0) or 0),
                             )
+                            columns = [column["name"] for column in column_defs]
                             if not columns:
                                 self.queue.put(("log", f"DataX skipped table: {db}.{table} (no columns)\n"))
                                 return 0, table, "", ""
@@ -363,8 +371,22 @@ class SyncWorkerMixin:
                             )
                             channel = int(datax_cfg.get("channel", 2))
                             batch_size = int(datax_cfg.get("batch_size", 2000))
-                            split_pk_disp = split_pk if split_pk else "none"
-                            job_file = build_datax_job(self.workspace, db, table, columns, source_uri, target_uri, datax_cfg, split_pk=split_pk)
+                            has_json_columns = any(column.get("data_type") == "json" for column in column_defs)
+                            if has_json_columns:
+                                split_pk_disp = f"{split_pk} -> disabled(json-cast)" if split_pk else "disabled(json-cast)"
+                            else:
+                                split_pk_disp = split_pk if split_pk else "none"
+                            job_file = build_datax_job(
+                                self.workspace,
+                                db,
+                                table,
+                                columns,
+                                source_uri,
+                                target_uri,
+                                datax_cfg,
+                                split_pk=split_pk,
+                                column_defs=column_defs,
+                            )
                             cmd_datax = build_datax_command(job_file, datax_cmd_cfg)
                             self.queue.put(("log", f"DataX [{t_idx}/{len(tables)}] {db}.{table} (channel={channel}, batch={batch_size}, splitPk={split_pk_disp})\n"))
                             cmd_env = os.environ.copy()

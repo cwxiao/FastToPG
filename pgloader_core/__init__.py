@@ -23,9 +23,11 @@ from .common import (
     should_skip_table,
 )
 from .database import (
+    coerce_target_json_columns_to_text,
     clear_target_public_table_data,
     clear_target_public_tables,
     clear_target_public_views,
+    get_mysql_column_defs,
     ensure_target_primary_keys,
     get_mysql_columns,
     get_mysql_databases,

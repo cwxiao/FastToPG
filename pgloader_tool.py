@@ -651,6 +651,55 @@ def get_mysql_columns(
     return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 
 
+def get_mysql_column_defs(
+    mysql_container: str,
+    user: str,
+    password: str,
+    db: str,
+    table: str,
+    host: str = "",
+    port: int = 0,
+) -> List[Dict[str, str]]:
+    cmd = [
+        "docker",
+        "exec",
+        mysql_container,
+        "mysql",
+        f"-u{user}",
+        f"-p{password}",
+        "-N",
+    ]
+    if host:
+        cmd.extend(["-h", host])
+    if port:
+        cmd.extend(["-P", str(port)])
+    cmd.extend([
+        "-e",
+        (
+            "SELECT column_name, data_type FROM information_schema.columns "
+            f"WHERE table_schema='{db}' AND table_name='{table}' ORDER BY ordinal_position;"
+        ),
+    ])
+    result = run_command(cmd)
+    if result.returncode != 0:
+        return []
+
+    column_defs: List[Dict[str, str]] = []
+    for line in (result.stdout or "").splitlines():
+        row = line.strip()
+        if not row:
+            continue
+        parts = row.split("\t")
+        if len(parts) < 2:
+            continue
+        column_name = parts[0].strip()
+        data_type = parts[1].strip().lower()
+        if not column_name:
+            continue
+        column_defs.append({"name": column_name, "data_type": data_type})
+    return column_defs
+
+
 def get_mysql_primary_key_map(
     mysql_container: str,
     user: str,
@@ -838,6 +887,140 @@ def ensure_target_primary_keys(db: str, config: Dict, selected_tables: Optional[
     return result.returncode
 
 
+def get_target_json_columns(db: str, config: Dict, selected_tables: Optional[List[str]] = None) -> tuple[int, Dict[str, List[str]], str]:
+    target_cfg = config.get("target", {})
+    target_uri = target_cfg.get("uri", "").replace("{{DB_NAME}}", db)
+    target = parse_db_uri(target_uri)
+
+    if target.get("scheme") not in ("postgresql", "pgsql", "postgres"):
+        return 1, {}, f"Skip inspect target json columns: unsupported target scheme {target.get('scheme')}\n"
+
+    selected = parse_selected_tables(selected_tables)
+    filter_sql = ""
+    if selected:
+        literals = ", ".join(sql_quote_literal(name.lower()) for name in selected)
+        filter_sql = f" AND table_name IN ({literals})"
+
+    sql = (
+        "COPY ("
+        "SELECT table_name, column_name FROM information_schema.columns "
+        "WHERE table_schema='public' AND data_type IN ('json', 'jsonb')"
+        f"{filter_sql} "
+        "ORDER BY table_name, ordinal_position"
+        ") TO STDOUT WITH DELIMITER E'\t';"
+    )
+
+    pg_user = str(target.get("user", ""))
+    pg_db = str(target.get("database", ""))
+    pg_host = str(target.get("host", ""))
+    pg_port = str(target.get("port", 5432) or 5432)
+    psql_container = (target_cfg.get("psql_container") or "postgres16").strip()
+
+    container_cmd = [
+        "docker",
+        "exec",
+        "-e",
+        f"PGPASSWORD={str(target.get('password', ''))}",
+        psql_container,
+        "psql",
+        "-h",
+        pg_host,
+        "-p",
+        pg_port,
+        "-U",
+        pg_user,
+        "-d",
+        pg_db,
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-q",
+        "-c",
+        sql,
+    ]
+    container_result = run_command(container_cmd)
+    if container_result.returncode == 0:
+        output = (container_result.stdout or "") + (container_result.stderr or "")
+    else:
+        psql_cmd = target_cfg.get("psql", "psql")
+        local_cmd = [
+            psql_cmd,
+            "-h",
+            pg_host,
+            "-p",
+            pg_port,
+            "-U",
+            pg_user,
+            "-d",
+            pg_db,
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-q",
+            "-c",
+            sql,
+        ]
+        cmd_env = os.environ.copy()
+        password = str(target.get("password", ""))
+        if password:
+            cmd_env["PGPASSWORD"] = password
+        local_result = run_command(local_cmd, env=cmd_env)
+        if local_result.returncode != 0:
+            output = (
+                (container_result.stdout or "")
+                + (container_result.stderr or "")
+                + (local_result.stdout or "")
+                + (local_result.stderr or "")
+            )
+            return local_result.returncode, {}, output
+        output = (local_result.stdout or "") + (local_result.stderr or "")
+
+    json_columns: Dict[str, List[str]] = {}
+    for line in output.splitlines():
+        row = line.strip()
+        if not row:
+            continue
+        parts = row.split("\t")
+        if len(parts) < 2:
+            continue
+        table_name = parts[0].strip()
+        column_name = parts[1].strip()
+        if not table_name or not column_name:
+            continue
+        json_columns.setdefault(table_name, []).append(column_name)
+    return 0, json_columns, output
+
+
+def coerce_target_json_columns_to_text(db: str, config: Dict, selected_tables: Optional[List[str]] = None) -> int:
+    target_cfg = config.get("target", {})
+    target_uri = target_cfg.get("uri", "").replace("{{DB_NAME}}", db)
+    target = parse_db_uri(target_uri)
+
+    if target.get("scheme") not in ("postgresql", "pgsql", "postgres"):
+        print(f"Skip coerce target json columns: unsupported target scheme {target.get('scheme')}")
+        return 1
+
+    code, json_columns, detail = get_target_json_columns(db, config, selected_tables=selected_tables)
+    if code != 0:
+        sys.stdout.write(f"检查目标库 JSON 列失败: {db}\n{detail}")
+        return code
+    if not json_columns:
+        print(f"目标库 JSON 列转换跳过: {db} (none)")
+        return 0
+
+    sql_blocks: List[str] = []
+    total_columns = 0
+    for table_name, columns in json_columns.items():
+        table_ident = pg_quote_ident(table_name)
+        for column_name in columns:
+            total_columns += 1
+            column_ident = pg_quote_ident(column_name)
+            sql_blocks.append(
+                f"ALTER TABLE public.{table_ident} ALTER COLUMN {column_ident} TYPE text USING {column_ident}::text;"
+            )
+
+    print(f"目标库 JSON 列转 text: {target.get('database', '')}，tables={len(json_columns)}，columns={total_columns}")
+    return run_pg_sql(db, config, "\n".join(sql_blocks))
+
+
 def get_mysql_split_pk(
     mysql_container: str,
     user: str,
@@ -910,6 +1093,25 @@ def pg_ident(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def build_mysql_query_sql(table: str, column_defs: List[Dict[str, str]]) -> str:
+    select_items: List[str] = []
+    for column in column_defs:
+        name = str(column.get("name", "")).strip()
+        data_type = str(column.get("data_type", "")).strip().lower()
+        if not name:
+            continue
+        ident = mysql_ident(name)
+        if data_type == "json":
+            select_items.append(f"CAST({ident} AS CHAR) AS {ident}")
+        else:
+            select_items.append(ident)
+    return f"SELECT {', '.join(select_items)} FROM {mysql_ident(table)}"
+
+
+def has_mysql_json_columns(column_defs: List[Dict[str, str]]) -> bool:
+    return any(str(column.get("data_type", "")).strip().lower() == "json" for column in column_defs)
+
+
 def build_datax_job(
     workspace: str,
     db: str,
@@ -919,6 +1121,7 @@ def build_datax_job(
     target_uri: str,
     datax_cfg: Dict,
     split_pk: Optional[str] = None,
+    column_defs: Optional[List[Dict[str, str]]] = None,
 ) -> str:
     source = parse_db_uri(source_uri)
     target = parse_db_uri(target_uri)
@@ -933,6 +1136,7 @@ def build_datax_job(
         sep = "&" if "?" in source_jdbc else "?"
         source_jdbc = f"{source_jdbc}{sep}{mysql_jdbc_params}"
     target_jdbc = f"jdbc:postgresql://{target['host']}:{target['port']}/{target['database']}"
+    normalized_column_defs = column_defs or [{"name": col, "data_type": ""} for col in columns]
     reader_columns = [mysql_ident(col) for col in columns]
     writer_columns = [
         pg_ident(col.lower() if bool(datax_cfg.get("target_column_lowercase", True)) else col)
@@ -953,10 +1157,8 @@ def build_datax_job(
                         "parameter": {
                             "username": source["user"],
                             "password": source["password"],
-                            "column": reader_columns,
                             "connection": [
                                 {
-                                    "table": [mysql_ident(table)],
                                     "jdbcUrl": [source_jdbc],
                                 }
                             ],
@@ -982,7 +1184,15 @@ def build_datax_job(
         }
     }
 
-    if split_pk:
+    reader_parameter = job["job"]["content"][0]["reader"]["parameter"]
+    reader_connection = reader_parameter["connection"][0]
+    if has_mysql_json_columns(normalized_column_defs):
+        reader_connection["querySql"] = [build_mysql_query_sql(table, normalized_column_defs)]
+    else:
+        reader_parameter["column"] = reader_columns
+        reader_connection["table"] = [mysql_ident(table)]
+
+    if split_pk and "querySql" not in reader_connection:
         job["job"]["content"][0]["reader"]["parameter"]["splitPk"] = split_pk
 
     job_folder = os.path.join(workspace, job_dir)
@@ -1181,6 +1391,10 @@ def run_datax_for_db(db: str, config: Dict, workspace: str, selected_tables: Opt
         print(f"DataX skipped: no tables left after exclude rule in {db}")
         return 0
 
+    coerce_code = coerce_target_json_columns_to_text(db, config, selected_tables=selected)
+    if coerce_code != 0:
+        return coerce_code
+
     print(f"DataX start: {db}, tables={len(tables)}")
     if skipped_by_rule > 0:
         print(f"DataX skip-by-rule: {skipped_by_rule} tables")
@@ -1192,7 +1406,7 @@ def run_datax_for_db(db: str, config: Dict, workspace: str, selected_tables: Opt
     output_lock = threading.Lock()
 
     def run_one_table(idx: int, table: str) -> tuple[int, str, List[str], str]:
-        columns = get_mysql_columns(
+        column_defs = get_mysql_column_defs(
             str(mysql_conn.get("container", "")),
             str(mysql_conn.get("user", "")),
             str(mysql_conn.get("password", "")),
@@ -1201,6 +1415,7 @@ def run_datax_for_db(db: str, config: Dict, workspace: str, selected_tables: Opt
             host=str(mysql_conn.get("host", "")),
             port=int(mysql_conn.get("port", 0) or 0),
         )
+        columns = [column["name"] for column in column_defs]
         if not columns:
             with output_lock:
                 print(f"DataX skipped table: {db}.{table} (no columns)")
@@ -1218,8 +1433,22 @@ def run_datax_for_db(db: str, config: Dict, workspace: str, selected_tables: Opt
 
         channel = int(datax_cfg.get("channel", 2))
         batch_size = int(datax_cfg.get("batch_size", 2000))
-        split_pk_disp = split_pk if split_pk else "none"
-        job_file = build_datax_job(workspace, db, table, columns, source_uri, target_uri, datax_cfg, split_pk=split_pk)
+        has_json_columns = any(column.get("data_type") == "json" for column in column_defs)
+        if has_json_columns:
+            split_pk_disp = f"{split_pk} -> disabled(json-cast)" if split_pk else "disabled(json-cast)"
+        else:
+            split_pk_disp = split_pk if split_pk else "none"
+        job_file = build_datax_job(
+            workspace,
+            db,
+            table,
+            columns,
+            source_uri,
+            target_uri,
+            datax_cfg,
+            split_pk=split_pk,
+            column_defs=column_defs,
+        )
         cmd = build_datax_command(job_file, datax_cmd_cfg)
         with output_lock:
             print(f"DataX [{idx}/{len(tables)}] {db}.{table} (channel={channel}, batch={batch_size}, splitPk={split_pk_disp})")
